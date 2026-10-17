@@ -55,6 +55,7 @@ class TradingOrchestrator:
 
         self.latest_daily_review: str = ""
         self.latest_morning_briefing: str = ""
+        self.latest_weekly_review: str = ""
         self.latest_screening_candidates: Dict[str, List[str]] = {
             "SLOT_A": ["005930", "000660", "005380"],
             "SLOT_D": ["005930", "000660", "035420"]
@@ -70,6 +71,9 @@ class TradingOrchestrator:
             m_path = Path("reports/morning_briefing.md")
             if m_path.exists():
                 self.latest_morning_briefing = m_path.read_text(encoding="utf-8").strip()
+            w_path = Path("reports/weekly_review.md")
+            if w_path.exists():
+                self.latest_weekly_review = w_path.read_text(encoding="utf-8").strip()
         except Exception as e:
             logger.warning(f"기존 리포트 캐시 로드 실패: {e}")
 
@@ -136,6 +140,20 @@ class TradingOrchestrator:
                     force_regenerate=True
                 )
                 await self._save_daily_settlement_record(self.latest_daily_review, screening)
+
+                # 금요일 또는 주말 기동 시 주간 퀀트 손익비 진단 리포트 동시 생성
+                if now.weekday() >= 4:
+                    try:
+                        weekly_trades = await self.ledger.get_trades_for_days(days=7)
+                        weekly_settlements = await self.ledger.get_daily_settlements(limit=7)
+                        self.latest_weekly_review = await self.gemini_analyst.generate_weekly_evaluation(
+                            weekly_trades=[t.model_dump() for t in weekly_trades],
+                            weekly_settlements=[s.model_dump() for s in weekly_settlements],
+                            accounts=[a.model_dump() for a in accounts],
+                            force_regenerate=True
+                        )
+                    except Exception as e_w:
+                        logger.warning(f"주간 손익비 복기 캐치업 예외: {e_w}")
             except Exception as e:
                 logger.warning(f"장후 복기 캐치업 예외: {e}")
 
@@ -489,6 +507,20 @@ class TradingOrchestrator:
                             force_regenerate=True
                         )
                         await self._save_daily_settlement_record(self.latest_daily_review, screening)
+
+                        # 금요일 15:40 주간 퀀트 손익비 진단 리포트 동시 발행
+                        if now.weekday() == 4:
+                            try:
+                                weekly_trades = await self.ledger.get_trades_for_days(days=7)
+                                weekly_settlements = await self.ledger.get_daily_settlements(limit=7)
+                                self.latest_weekly_review = await self.gemini_analyst.generate_weekly_evaluation(
+                                    weekly_trades=[t.model_dump() for t in weekly_trades],
+                                    weekly_settlements=[s.model_dump() for s in weekly_settlements],
+                                    accounts=[a.model_dump() for a in accounts],
+                                    force_regenerate=True
+                                )
+                            except Exception as e_w:
+                                logger.warning(f"주간 손익비 복기 예외: {e_w}")
                     except Exception as e:
                         logger.warning(f"장후 복기 예외: {e}")
 

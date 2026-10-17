@@ -153,6 +153,92 @@ fun IntelligenceScreen(
             }
         }
 
+        // 2-1. 🏛️ 주간 퀀트 손익비 진단 리포트 카드 (주간 결산)
+        if (intelligence.weekly_review.isNotBlank()) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, Color(0xFFFFD700).copy(alpha = 0.5f))
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0x26FFD700)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color(0xFFFFD700), modifier = Modifier.size(20.dp))
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("주간 퀀트 손익비 진단 리포트", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    Spacer(Modifier.width(6.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(4.dp),
+                                        color = Color(0x33FFD700)
+                                    ) {
+                                        Text("WEEKLY PAYOFF", color = Color(0xFFFFD700), fontSize = 9.sp, fontWeight = FontWeight.Black, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
+                                    }
+                                }
+                                Text("승률 탈피 · 손익비 & 빠른 칼손절 중심 전략 평가", color = TextSecondary, fontSize = 11.sp)
+                            }
+                        }
+
+                        Spacer(Modifier.height(14.dp))
+
+                        intelligence.weekly_review.lines().forEach { line ->
+                            when {
+                                line.startsWith("### ") -> {
+                                    Text(
+                                        text = line.removePrefix("### "),
+                                        color = Color(0xFFFFD700),
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+                                }
+                                line.startsWith("#### ") -> {
+                                    Text(
+                                        text = line.removePrefix("#### "),
+                                        color = TextPrimary,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(top = 8.dp, bottom = 2.dp)
+                                    )
+                                }
+                                line.startsWith("  - ") || line.startsWith("- ") -> {
+                                    val cleanLine = line.trimStart(' ', '-')
+                                    Row(modifier = Modifier.padding(vertical = 2.dp)) {
+                                        Text("• ", color = Color(0xFFFFD700), fontSize = 12.sp)
+                                        Text(
+                                            text = cleanLine.replace("**", ""),
+                                            color = TextSecondary,
+                                            fontSize = 12.sp,
+                                            lineHeight = 16.sp
+                                        )
+                                    }
+                                }
+                                line.isNotBlank() -> {
+                                    Text(
+                                        text = line.replace("**", ""),
+                                        color = TextSecondary,
+                                        fontSize = 12.sp,
+                                        lineHeight = 16.sp,
+                                        modifier = Modifier.padding(vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 3. 15:40 장후 스크리닝 선정 종목 (D+1 대응) 카드
         val candidatesMap = intelligence.screening_candidates
         val hasCandidates = candidatesMap.values.any { it.isNotEmpty() }

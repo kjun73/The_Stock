@@ -76,6 +76,7 @@ data class TradeRecordDto(
 @Serializable
 data class IntelligenceDto(
     val daily_review: String = "",
+    val weekly_review: String = "",
     val morning_briefing: String = "",
     val screening_candidates: Map<String, List<String>> = emptyMap(),
     val updated_at: String = ""

@@ -456,6 +456,45 @@ class SqliteLedger:
                 ))
             return trades
 
+    async def get_trades_for_days(
+        self,
+        days: int = 7,
+        slot_id: Optional[str] = None
+    ) -> List[TradeRecord]:
+        """최근 N일간의 체결 거래 내역 조회"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = "SELECT * FROM trade_records WHERE exit_time >= datetime('now', ? || ' days')"
+            params = [f"-{days}"]
+            if slot_id:
+                query += " AND slot_id = ?"
+                params.append(slot_id)
+            query += " ORDER BY id DESC"
+
+            cursor = await db.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+            trades = []
+            for r in rows:
+                t_name = r["name"] if "name" in r.keys() and r["name"] else STOCK_NAME_MAP.get(r["ticker"], "")
+                trades.append(TradeRecord(
+                    id=r["id"],
+                    slot_id=r["slot_id"],
+                    ticker=r["ticker"],
+                    name=t_name,
+                    asset_type=r["asset_type"],
+                    quantity=r["quantity"],
+                    buy_price=r["buy_price"],
+                    sell_price=r["sell_price"],
+                    gross_pnl=r["gross_pnl"],
+                    total_cost=r["total_cost"],
+                    net_pnl=r["net_pnl"],
+                    profit_rate=r["profit_rate"],
+                    entry_time=datetime.fromisoformat(r["entry_time"]) if isinstance(r["entry_time"], str) else r["entry_time"],
+                    exit_time=datetime.fromisoformat(r["exit_time"]) if isinstance(r["exit_time"], str) else r["exit_time"],
+                    exit_reason=r["exit_reason"]
+                ))
+            return trades
+
     async def save_daily_settlement(
         self,
         date: str,

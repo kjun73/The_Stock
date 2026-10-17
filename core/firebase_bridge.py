@@ -309,6 +309,7 @@ class FirebaseBridge:
                         ],
                         "intelligence": {
                             "daily_review": getattr(self.orchestrator, "latest_daily_review", ""),
+                            "weekly_review": getattr(self.orchestrator, "latest_weekly_review", ""),
                             "morning_briefing": getattr(self.orchestrator, "latest_morning_briefing", ""),
                             "screening_candidates": getattr(self.orchestrator, "latest_screening_candidates", {}),
                             "updated_at": datetime.now().isoformat()

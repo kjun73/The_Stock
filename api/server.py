@@ -276,3 +276,15 @@ async def get_daily_settlement(date: str):
         raise HTTPException(status_code=404, detail=f"{date} 일자의 결산 기록이 존재하지 않습니다.")
     return settlement.model_dump()
 
+
+@app.get("/api/reports/weekly")
+async def get_weekly_report():
+    """최신 주간 퀀트 손익비 진단 리포트 조회"""
+    report = getattr(orchestrator, "latest_weekly_review", "")
+    if not report:
+        w_path = Path("reports/weekly_review.md")
+        if w_path.exists():
+            report = w_path.read_text(encoding="utf-8").strip()
+    return {"weekly_review": report}
+
+
