@@ -13,7 +13,7 @@ from broker.toss_client import TossClient
 from core.config import settings
 from core.firebase_bridge import FirebaseBridge
 from core.ledger import SqliteLedger
-from core.models import SlotAccount, SlotPosition, TickData, TradeRecord
+from core.models import DailySettlement, SlotAccount, SlotPosition, TickData, TradeRecord
 from core.orchestrator import TradingOrchestrator
 
 logging.basicConfig(
@@ -237,10 +237,10 @@ async def get_app_version():
     """
     apk_path = Path(__file__).resolve().parent.parent / "android-app" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
     return {
-        "versionCode": 5,
-        "versionName": "1.0.4",
-        "apkUrl": "https://github.com/kjun73/The_Stock/releases/download/v1.0.4/app-debug.apk",
-        "notes": "15:40 AI 일일 결산 복기 및 장후 스크리닝 후보군 실시간 연동",
+        "versionCode": 6,
+        "versionName": "1.0.5",
+        "apkUrl": "https://github.com/kjun73/The_Stock/releases/download/v1.0.5/app-debug.apk",
+        "notes": "개장일 자동 기동/종료 엔진 및 모바일 원격 제어 보안 개편",
         "isForce": False,
         "hasApk": apk_path.is_file()
     }
@@ -259,3 +259,20 @@ async def download_apk():
         filename="The_Stock_C2.apk",
         media_type="application/vnd.android.package-archive"
     )
+
+
+@app.get("/api/settlements")
+async def get_daily_settlements(limit: int = Query(default=30, ge=1, le=365)):
+    """최근 일일 결산/복기 히스토리 목록 조회"""
+    settlements = await ledger.get_daily_settlements(limit=limit)
+    return [s.model_dump() for s in settlements]
+
+
+@app.get("/api/settlements/{date}")
+async def get_daily_settlement(date: str):
+    """특정 일자의 결산/복기 조회 (형식: YYYY-MM-DD)"""
+    settlement = await ledger.get_daily_settlement(date=date)
+    if not settlement:
+        raise HTTPException(status_code=404, detail=f"{date} 일자의 결산 기록이 존재하지 않습니다.")
+    return settlement.model_dump()
+

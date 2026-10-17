@@ -135,3 +135,46 @@ async def test_ledger_capital_isolation_and_trading(tmp_path):
     # 포지션이 비워졌는지 확인
     positions = await ledger.get_positions("SLOT_A")
     assert len(positions) == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_settlement_persistence(tmp_path):
+    """일일 장마감 결산 스냅샷 저장 및 날짜별 히스토리 조회 검증"""
+    test_db = str(tmp_path / "test_settlement.db")
+    ledger = SqliteLedger(db_path=test_db)
+    await ledger.init_db()
+
+    # 1. 초기 상태에서 결산 저장
+    saved = await ledger.save_daily_settlement(
+        date="2026-10-17",
+        total_asset=40_152_750.0,
+        cash_balance=34_237_460.0,
+        stock_value=5_915_290.0,
+        total_profit=152_750.0,
+        profit_rate=0.38,
+        realized_pnl=0.0,
+        unrealized_pnl=152_750.0,
+        trade_count=3,
+        review_markdown="### 2026-10-17 복기 리포트",
+        screening_json='{"SLOT_A": ["005930"]}'
+    )
+    assert saved.date == "2026-10-17"
+    assert saved.total_asset == 40_152_750.0
+    assert saved.profit_rate == 0.38
+
+    # 2. 목록 조회 검증
+    settlements = await ledger.get_daily_settlements(limit=10)
+    assert len(settlements) == 1
+    assert settlements[0].date == "2026-10-17"
+    assert settlements[0].stock_value == 5_915_290.0
+
+    # 3. 단일 일자 조회 검증
+    s = await ledger.get_daily_settlement("2026-10-17")
+    assert s is not None
+    assert s.cash_balance == 34_237_460.0
+    assert "2026-10-17 복기 리포트" in s.review_markdown
+
+    # 4. 존재하지 않는 일자 조회 시 None
+    non_existent = await ledger.get_daily_settlement("2099-01-01")
+    assert non_existent is None
+

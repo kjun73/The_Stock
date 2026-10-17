@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import httpx
@@ -10,6 +11,7 @@ from core.config import settings
 logger = logging.getLogger(__name__)
 
 REPORT_DIR = Path("reports")
+REPORT_HISTORY_DIR = REPORT_DIR / "history"
 
 
 class GeminiAnalyst:
@@ -17,15 +19,29 @@ class GeminiAnalyst:
     Antigravity(Gemini) 기반 거시 시황 분석 및 매매 복기 분석기:
     - 08:50 장전 브리핑: Antigravity가 작성한 `reports/morning_briefing.md` 최우선 연동
     - 15:40 당일 복기 리포트: Antigravity가 작성한 `reports/daily_review.md` 최우선 연동
+    - 날짜별 영구 아카이빙: `reports/history/daily_review_YYYY-MM-DD.md` 자동 저장
     - 외부 API 키가 없어도 100% 정상 작동하며 Antigravity 세션과 유기적으로 동기화됩니다.
     """
     def __init__(self):
         self.api_key = settings.GEMINI_API_KEY
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        REPORT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _save_report(self, file_path: Path, history_path: Path, content: str):
+        """최신 단일 파일 및 날짜별 영구 히스토리 파일 동시 저장"""
+        try:
+            file_path.write_text(content, encoding="utf-8")
+            history_path.write_text(content, encoding="utf-8")
+            logger.info(f"📄 [GeminiAnalyst] 리포트 저장 완료: {file_path.name} & history/{history_path.name}")
+        except Exception as e:
+            logger.warning(f"리포트 파일 저장 실패: {e}")
 
     async def generate_morning_briefing(self, market_summary: Dict[str, Any], force_regenerate: bool = False) -> str:
         """장전 08:50 글로벌 지수, 환율, 코스피 20일선 상태 브리핑"""
+        today_str = datetime.now().strftime("%Y-%m-%d")
         file_path = REPORT_DIR / "morning_briefing.md"
+        history_path = REPORT_HISTORY_DIR / f"morning_briefing_{today_str}.md"
+
         if not force_regenerate and file_path.exists():
             try:
                 content = file_path.read_text(encoding="utf-8").strip()
@@ -44,10 +60,7 @@ class GeminiAnalyst:
 """
             res = await self._call_gemini(prompt)
             if res and not res.startswith("Gemini"):
-                try:
-                    file_path.write_text(res, encoding="utf-8")
-                except Exception:
-                    pass
+                self._save_report(file_path, history_path, res)
                 return res
 
         # 3. 기본 Antigravity 시황 분석 포맷
@@ -63,10 +76,7 @@ class GeminiAnalyst:
             + ("슬롯 A(수급 스윙) 및 슬롯 B(ETF 그리드) 적극 진입 유효." if is_bull else "슬롯 A/C/D 신규 진입 차단(현금 100% 보존), 슬롯 B 분할 매수만 허용.") + "\n"
             "- **주요 관제 포인트**: 당일 거래대금 급증 종목에 대한 JEV 1.13 가드레일 모니터링 가동."
         )
-        try:
-            file_path.write_text(briefing, encoding="utf-8")
-        except Exception:
-            pass
+        self._save_report(file_path, history_path, briefing)
         return briefing
 
     async def generate_daily_review(
@@ -80,7 +90,9 @@ class GeminiAnalyst:
         """15:40 4대 슬롯 당일 체결 내역, 보유 포지션 및 스크리닝 종합 복기 리포트"""
         positions = positions or []
         screening_candidates = screening_candidates or {}
+        today_str = datetime.now().strftime("%Y-%m-%d")
         file_path = REPORT_DIR / "daily_review.md"
+        history_path = REPORT_HISTORY_DIR / f"daily_review_{today_str}.md"
 
         # force_regenerate가 False이고 파일이 유효한 경우에만 기존 파일 반환
         if not force_regenerate and file_path.exists():
@@ -114,10 +126,7 @@ class GeminiAnalyst:
 """
             report = await self._call_gemini(prompt)
             if report and not report.startswith("Gemini"):
-                try:
-                    file_path.write_text(report, encoding="utf-8")
-                except Exception as e:
-                    logger.warning(f"리포트 파일 쓰기 실패: {e}")
+                self._save_report(file_path, history_path, report)
                 return report
 
         # 3. 고정밀 퀀트 분석 엔진 기반 자동 복기 생성
@@ -176,12 +185,7 @@ class GeminiAnalyst:
 - **슬롯 B**: KODEX 코스닥150 볼린저 밴드 중심선(20MA) 도달 시 50% 분할 익절 대기.
 - **슬롯 C/D**: 당일 래리 윌리엄스 돌파 및 52주 신고가 첫 눌림목 조건 부합 시 초고속 JEV 가드레일 경유 진입."""
 
-        try:
-            file_path.write_text(report, encoding="utf-8")
-            logger.info("📄 [GeminiAnalyst] reports/daily_review.md 신규 작성 및 저장 완료")
-        except Exception as e:
-            logger.warning(f"복기 파일 저장 실패: {e}")
-
+        self._save_report(file_path, history_path, report)
         return report
 
     async def _call_gemini(self, prompt: str) -> str:

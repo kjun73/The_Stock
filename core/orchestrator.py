@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, time as dtime
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -134,10 +135,53 @@ class TradingOrchestrator:
                     screening_candidates=screening,
                     force_regenerate=True
                 )
+                await self._save_daily_settlement_record(self.latest_daily_review, screening)
             except Exception as e:
                 logger.warning(f"장후 복기 캐치업 예외: {e}")
 
             self._last_evening_screen_date = today_str
+
+    async def _save_daily_settlement_record(self, review_markdown: str, screening: dict):
+        """당일 결산 및 AI 복기 결과를 SQLite daily_settlements 원장에 영구 기록"""
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            accounts = await self.ledger.get_accounts()
+            positions = await self.ledger.get_positions()
+            trades = await self.ledger.get_recent_trades(limit=50)
+
+            # 당일 청산된 거래만 필터링
+            today_trades = [
+                t for t in trades 
+                if (isinstance(t.exit_time, datetime) and t.exit_time.strftime("%Y-%m-%d") == today_str) or
+                   (isinstance(t.exit_time, str) and t.exit_time.startswith(today_str))
+            ]
+
+            total_initial = sum(a.initial_capital for a in accounts) or 40_000_000.0
+            total_asset = sum(a.total_asset for a in accounts)
+            total_cash = sum(a.cash_balance for a in accounts)
+            stock_value = sum(a.stock_value for a in accounts)
+            total_profit = sum(a.total_profit for a in accounts)
+            profit_rate = (total_profit / total_initial) * 100.0 if total_initial > 0 else 0.0
+
+            realized_pnl = sum(t.net_pnl for t in today_trades)
+            unrealized_pnl = total_profit - realized_pnl
+
+            await self.ledger.save_daily_settlement(
+                date=today_str,
+                total_asset=total_asset,
+                cash_balance=total_cash,
+                stock_value=stock_value,
+                total_profit=total_profit,
+                profit_rate=profit_rate,
+                realized_pnl=realized_pnl,
+                unrealized_pnl=unrealized_pnl,
+                trade_count=len(today_trades),
+                review_markdown=review_markdown,
+                screening_json=json.dumps(screening, ensure_ascii=False)
+            )
+            logger.info(f"💾 [Orchestrator] SQLite daily_settlements 원장에 {today_str} 일일 결산 영구 기록 완료")
+        except Exception as e:
+            logger.error(f"❌ [Orchestrator] 일일 결산 원장 기록 실패: {e}")
 
     def sync_all_subscriptions(self):
         """4대 슬롯 전략의 모든 유니버스 종목을 브로커 시세 구독 매니저에 일괄 등록"""
@@ -444,10 +488,17 @@ class TradingOrchestrator:
                             screening_candidates=screening,
                             force_regenerate=True
                         )
+                        await self._save_daily_settlement_record(self.latest_daily_review, screening)
                     except Exception as e:
                         logger.warning(f"장후 복기 예외: {e}")
 
                     self._last_evening_screen_date = today_str
+
+                # 4. 15:45 장후 결산 및 복기 완료 후 서버 자체 자동 종료 (정규장 마감 세션)
+                if current_time >= dtime(15, 45) and current_time < dtime(16, 0) and self._last_evening_screen_date == today_str and not getattr(self, '_shutdown_initiated', False):
+                    self._shutdown_initiated = True
+                    logger.info("⏰ [15:45] 정규장 마감 결산/복기 완료 -> 매매 서버 자체 자동 종료 시퀀스 가동")
+                    asyncio.create_task(self._trigger_auto_shutdown())
 
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
@@ -455,3 +506,15 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.error(f"❌ [Orchestrator] 스케줄러 루프 오류: {e}", exc_info=True)
                 await asyncio.sleep(5)
+
+    async def _trigger_auto_shutdown(self):
+        """15:45 장마감 결산 완료 후 매매 서버 자체 안전 종료"""
+        await asyncio.sleep(2)
+        logger.info("🛑 [Orchestrator] 서버 프로세스 안전 종료 중...")
+        try:
+            import os, signal
+            os.kill(os.getpid(), signal.SIGINT)
+        except Exception:
+            import os
+            os._exit(0)
+

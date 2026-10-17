@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Lock
 import com.example.thestock.BuildConfig
 import com.example.thestock.theme.*
 
@@ -123,7 +124,7 @@ fun SettingsScreen(
 
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        text = "스마트폰에서 클라우드를 통해 홈 PC의 주식 자동매매 백엔드 서버를 원클릭으로 켜고 끕니다.",
+                        text = "평일 08:35 개장일 자동 기동 및 15:45 장마감 자동 종료됩니다. 모바일에서는 비상 [서버 종료]만 가능하며, 수동 기동은 AI 채팅 세션에서 관리됩니다.",
                         color = TextSecondary,
                         fontSize = 12.sp,
                         lineHeight = 16.sp
@@ -135,19 +136,19 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Button(
-                            onClick = onStartServer,
+                            onClick = { /* 모바일 수동 기동 차단 (채팅 관리 정책) */ },
                             modifier = Modifier.weight(1f),
-                            enabled = serverControlState != "RUNNING" && serverControlState != "STARTING",
+                            enabled = false,
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = NeonGreen,
-                                contentColor = BackgroundDark,
+                                containerColor = SurfaceVariantDark,
+                                contentColor = TextMuted,
                                 disabledContainerColor = SurfaceVariantDark,
                                 disabledContentColor = TextMuted
                             )
                         ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("서버 기동", fontWeight = FontWeight.Bold)
+                            Text("채팅에서 기동", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         }
 
                         Button(

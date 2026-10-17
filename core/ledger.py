@@ -13,6 +13,7 @@ from core.models import (
     SlotPosition,
     TickData,
     TradeRecord,
+    DailySettlement,
 )
 
 DEFAULT_SLOTS = [
@@ -80,6 +81,23 @@ class SqliteLedger:
                     entry_time TIMESTAMP NOT NULL,
                     exit_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     exit_reason TEXT NOT NULL
+                );
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS daily_settlements (
+                    date TEXT PRIMARY KEY,
+                    total_asset REAL NOT NULL,
+                    cash_balance REAL NOT NULL,
+                    stock_value REAL NOT NULL,
+                    total_profit REAL NOT NULL,
+                    profit_rate REAL NOT NULL,
+                    realized_pnl REAL DEFAULT 0.0,
+                    unrealized_pnl REAL DEFAULT 0.0,
+                    trade_count INTEGER DEFAULT 0,
+                    review_markdown TEXT DEFAULT '',
+                    screening_json TEXT DEFAULT '{}',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
 
@@ -437,3 +455,100 @@ class SqliteLedger:
                     exit_reason=r["exit_reason"]
                 ))
             return trades
+
+    async def save_daily_settlement(
+        self,
+        date: str,
+        total_asset: float,
+        cash_balance: float,
+        stock_value: float,
+        total_profit: float,
+        profit_rate: float,
+        realized_pnl: float = 0.0,
+        unrealized_pnl: float = 0.0,
+        trade_count: int = 0,
+        review_markdown: str = "",
+        screening_json: str = "{}"
+    ) -> DailySettlement:
+        """일일 장마감 결산 스냅샷 및 AI 복기 결과를 SQLite 원장에 영구 기록 (UPSERT)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO daily_settlements (
+                    date, total_asset, cash_balance, stock_value,
+                    total_profit, profit_rate, realized_pnl, unrealized_pnl,
+                    trade_count, review_markdown, screening_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                date, total_asset, cash_balance, stock_value,
+                total_profit, profit_rate, realized_pnl, unrealized_pnl,
+                trade_count, review_markdown, screening_json
+            ))
+            await db.commit()
+
+        return DailySettlement(
+            date=date,
+            total_asset=total_asset,
+            cash_balance=cash_balance,
+            stock_value=stock_value,
+            total_profit=total_profit,
+            profit_rate=profit_rate,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            trade_count=trade_count,
+            review_markdown=review_markdown,
+            screening_json=screening_json,
+        )
+
+    async def get_daily_settlements(self, limit: int = 30) -> List[DailySettlement]:
+        """최근 일일 결산/복기 히스토리 목록 조회"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM daily_settlements ORDER BY date DESC LIMIT ?",
+                (limit,)
+            )
+            rows = await cursor.fetchall()
+            return [
+                DailySettlement(
+                    date=r["date"],
+                    total_asset=r["total_asset"],
+                    cash_balance=r["cash_balance"],
+                    stock_value=r["stock_value"],
+                    total_profit=r["total_profit"],
+                    profit_rate=r["profit_rate"],
+                    realized_pnl=r["realized_pnl"],
+                    unrealized_pnl=r["unrealized_pnl"],
+                    trade_count=r["trade_count"],
+                    review_markdown=r["review_markdown"],
+                    screening_json=r["screening_json"],
+                    created_at=datetime.fromisoformat(r["created_at"]) if isinstance(r["created_at"], str) else r["created_at"]
+                )
+                for r in rows
+            ]
+
+    async def get_daily_settlement(self, date: str) -> Optional[DailySettlement]:
+        """특정 일자의 결산/복기 조회"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM daily_settlements WHERE date = ?",
+                (date,)
+            )
+            r = await cursor.fetchone()
+            if not r:
+                return None
+            return DailySettlement(
+                date=r["date"],
+                total_asset=r["total_asset"],
+                cash_balance=r["cash_balance"],
+                stock_value=r["stock_value"],
+                total_profit=r["total_profit"],
+                profit_rate=r["profit_rate"],
+                realized_pnl=r["realized_pnl"],
+                unrealized_pnl=r["unrealized_pnl"],
+                trade_count=r["trade_count"],
+                review_markdown=r["review_markdown"],
+                screening_json=r["screening_json"],
+                created_at=datetime.fromisoformat(r["created_at"]) if isinstance(r["created_at"], str) else r["created_at"]
+            )
+

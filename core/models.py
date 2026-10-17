@@ -125,3 +125,19 @@ class TradeRecord(BaseModel):
     entry_time: datetime
     exit_time: datetime = Field(default_factory=datetime.now)
     exit_reason: ExitReason
+
+
+class DailySettlement(BaseModel):
+    date: str  # YYYY-MM-DD
+    total_asset: float
+    cash_balance: float
+    stock_value: float
+    total_profit: float
+    profit_rate: float
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    trade_count: int = 0
+    review_markdown: str = ""
+    screening_json: str = "{}"
+    created_at: Optional[datetime] = Field(default_factory=datetime.now)
+

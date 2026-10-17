@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -24,6 +25,7 @@ class FirebaseBridge:
     Firebase Realtime Database (RTDB) 중계 브리지:
     - 홈 PC 백엔드 <-> 안드로이드 모바일 관제 앱 간 양방향 실시간 통신
     - 포트포워딩 및 VPN(Tailscale) 불필요, 구글 클라우드 경유 초저지연 상태 동기화
+    - 데몬 없이 매매 서버 자체에서 모바일 STOP 원격 종료 명령 직접 수신 및 안전 종료
     - 자격증명 파일 부재 시 Graceful Mock 모드로 안전하게 작동
     """
     def __init__(self, orchestrator: TradingOrchestrator):
@@ -33,6 +35,8 @@ class FirebaseBridge:
         self.is_running = False
         self._sync_task: Optional[asyncio.Task] = None
         self._listener_registration = None
+        self._server_control_listener_registration = None
+        self._last_handled_server_control_id = ""
         self.mock_mode = False
 
     def initialize(self) -> bool:
@@ -78,7 +82,9 @@ class FirebaseBridge:
 
         if not self.mock_mode and self.is_connected:
             self._start_command_listener()
+            self._start_server_control_listener()
             self.sync_app_version()
+            self.update_server_control_state("RUNNING")
 
         self._sync_task = asyncio.create_task(self._sync_loop())
         logger.info("📡 [FirebaseBridge] 상태 동기화 서비스 가동 시작")
@@ -99,15 +105,85 @@ class FirebaseBridge:
             except Exception:
                 pass
 
-        # 서버 종료 시 Firebase RTDB에 즉시 OFFLINE 마킹
+        if self._server_control_listener_registration:
+            try:
+                self._server_control_listener_registration.close()
+            except Exception:
+                pass
+
+        # 서버 종료 시 Firebase RTDB에 즉시 OFFLINE 및 STOPPED 마킹
         if not self.mock_mode and self.is_connected:
             try:
                 ref = db.reference('/system_status')
                 ref.update({"status": "OFFLINE", "server_status": "OFFLINE", "last_heartbeat": 0})
             except Exception:
                 pass
+            self.update_server_control_state("STOPPED")
 
         logger.info("✅ [FirebaseBridge] 상태 동기화 서비스 종료")
+
+    def update_server_control_state(self, state: str):
+        """Firebase RTDB /server_control 상태 동기화 (RUNNING / STOPPED)"""
+        if self.mock_mode or not self.is_connected:
+            return
+        try:
+            ref = db.reference('/server_control')
+            ref.update({
+                "state": state,
+                "pid": os.getpid() if state == "RUNNING" else 0,
+                "last_updated": int(datetime.now().timestamp() * 1000)
+            })
+            logger.info(f"📡 [FirebaseBridge] /server_control 상태 동기화: {state}")
+        except Exception as e:
+            logger.warning(f"⚠️ [FirebaseBridge] /server_control 상태 업데이트 실패: {e}")
+
+    def _start_server_control_listener(self):
+        """스마트폰 앱의 /server_control 원격 종료 명령 실시간 감시"""
+        try:
+            ref = db.reference('/server_control')
+
+            def _on_server_control(event):
+                if not event.data or not isinstance(event.data, dict):
+                    return
+                cmd = event.data.get("command")
+                cmd_id = event.data.get("command_id", "")
+                if cmd == "STOP" and cmd_id and cmd_id != self._last_handled_server_control_id:
+                    self._last_handled_server_control_id = cmd_id
+                    logger.info(f"🛑 [FirebaseBridge] 모바일 앱에서 서버 종료 명령 수신 (ID: {cmd_id})")
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = asyncio.get_event_loop()
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_server_stop_command(cmd_id),
+                        loop
+                    )
+
+            self._server_control_listener_registration = ref.listen(_on_server_control)
+            logger.info("🎧 [FirebaseBridge] /server_control 원격 종료 명령 수신 대기 중")
+        except Exception as e:
+            logger.error(f"❌ [FirebaseBridge] server_control 리스너 등록 실패: {e}")
+
+    async def _handle_server_stop_command(self, cmd_id: str):
+        """모바일 앱 STOP 명령 처리 및 서버 자체 안전 종료"""
+        try:
+            ref = db.reference('/server_control')
+            ref.update({
+                "command": "NONE",
+                "state": "STOPPED",
+                "last_handled_id": cmd_id
+            })
+            ref_status = db.reference('/system_status')
+            ref_status.update({"status": "OFFLINE", "server_status": "OFFLINE", "last_heartbeat": 0})
+        except Exception as e:
+            logger.warning(f"상태 업데이트 실패: {e}")
+
+        logger.info("🛑 [FirebaseBridge] 모바일 앱 요청에 따라 매매 서버 자체 안전 종료 시퀀스 가동...")
+        await asyncio.sleep(1)
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except Exception:
+            os._exit(0)
 
     def _start_command_listener(self):
         """안드로이드 앱에서 보낸 제어 명령(/commands) 실시간 리스닝"""
@@ -253,10 +329,10 @@ class FirebaseBridge:
 
     def sync_app_version(
         self,
-        version_code: int = 5,
-        version_name: str = "1.0.4",
-        apk_url: str = "https://github.com/kjun73/The_Stock/releases/download/v1.0.4/app-debug.apk",
-        notes: str = "15:40 AI 일일 결산 복기 및 장후 스크리닝 후보군 실시간 연동",
+        version_code: int = 6,
+        version_name: str = "1.0.5",
+        apk_url: str = "https://github.com/kjun73/The_Stock/releases/download/v1.0.5/app-debug.apk",
+        notes: str = "개장일 자동 기동/종료 엔진 및 모바일 원격 제어 보안 개편",
         is_force: bool = False
     ):
         """안드로이드 인앱 자동 업데이트 메타데이터 동기화"""
