@@ -1,0 +1,277 @@
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+from core.config import settings
+from core.orchestrator import TradingOrchestrator
+
+logger = logging.getLogger(__name__)
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
+    logger.warning("firebase-admin 패키지가 설치되지 않았습니다. pip install firebase-admin 필요.")
+
+
+class FirebaseBridge:
+    """
+    Firebase Realtime Database (RTDB) 중계 브리지:
+    - 홈 PC 백엔드 <-> 안드로이드 모바일 관제 앱 간 양방향 실시간 통신
+    - 포트포워딩 및 VPN(Tailscale) 불필요, 구글 클라우드 경유 초저지연 상태 동기화
+    - 자격증명 파일 부재 시 Graceful Mock 모드로 안전하게 작동
+    """
+    def __init__(self, orchestrator: TradingOrchestrator):
+        self.orchestrator = orchestrator
+        self.app: Optional[firebase_admin.App] = None
+        self.is_connected = False
+        self.is_running = False
+        self._sync_task: Optional[asyncio.Task] = None
+        self._listener_registration = None
+        self.mock_mode = False
+
+    def initialize(self) -> bool:
+        """Firebase Admin SDK 초기화"""
+        if not FIREBASE_AVAILABLE:
+            logger.warning("⚠️ [FirebaseBridge] firebase-admin 라이브러리 없음 -> Mock 모드로 동작")
+            self.mock_mode = True
+            return False
+
+        cred_path = settings.FIREBASE_CREDENTIALS_PATH
+        if not os.path.exists(cred_path):
+            logger.warning(
+                f"⚠️ [FirebaseBridge] 자격증명 파일({cred_path})을 찾을 수 없습니다. "
+                "안드로이드 연동을 위해 콘솔에서 서비스 계정 키를 발급받아 프로젝트 루트에 배치해 주세요. "
+                "현재는 로컬 Mock 브리지 모드로 안전하게 실행됩니다."
+            )
+            self.mock_mode = True
+            return False
+
+        try:
+            cred = credentials.Certificate(cred_path)
+            # 이미 초기화된 앱이 없을 때만 initialize_app 호출
+            if not firebase_admin._apps:
+                self.app = firebase_admin.initialize_app(cred, {
+                    'databaseURL': settings.FIREBASE_DB_URL
+                })
+            else:
+                self.app = firebase_admin.get_app()
+
+            self.is_connected = True
+            self.mock_mode = False
+            logger.info("🔥 [FirebaseBridge] Firebase Realtime Database 연결 성공!")
+            return True
+        except Exception as e:
+            logger.error(f"❌ [FirebaseBridge] Firebase 초기화 실패: {e}", exc_info=True)
+            self.mock_mode = True
+            return False
+
+    async def start(self):
+        """동기화 루프 및 안드로이드 원격 명령 리스너 시작"""
+        self.initialize()
+        self.is_running = True
+
+        if not self.mock_mode and self.is_connected:
+            self._start_command_listener()
+            self.sync_app_version()
+
+        self._sync_task = asyncio.create_task(self._sync_loop())
+        logger.info("📡 [FirebaseBridge] 상태 동기화 서비스 가동 시작")
+
+    async def stop(self):
+        """브리지 정상 종료"""
+        self.is_running = False
+        if self._sync_task:
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._listener_registration:
+            try:
+                self._listener_registration.close()
+            except Exception:
+                pass
+
+        # 서버 종료 시 Firebase RTDB에 즉시 OFFLINE 마킹
+        if not self.mock_mode and self.is_connected:
+            try:
+                ref = db.reference('/system_status')
+                ref.update({"status": "OFFLINE", "server_status": "OFFLINE", "last_heartbeat": 0})
+            except Exception:
+                pass
+
+        logger.info("✅ [FirebaseBridge] 상태 동기화 서비스 종료")
+
+    def _start_command_listener(self):
+        """안드로이드 앱에서 보낸 제어 명령(/commands) 실시간 리스닝"""
+        try:
+            ref = db.reference('/commands')
+
+            def _on_command(event):
+                # event.data가 dict 형태이고 processed가 아닐 때
+                if not event.data or not isinstance(event.data, dict):
+                    return
+
+                # 비동기 이벤트 루프에 커맨드 실행 위임
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_commands(event.data),
+                    asyncio.get_event_loop()
+                )
+
+            self._listener_registration = ref.listen(_on_command)
+            logger.info("🎧 [FirebaseBridge] /commands 원격 제어 명령 수신 대기 중")
+        except Exception as e:
+            logger.error(f"❌ [FirebaseBridge] 명령 리스너 등록 실패: {e}")
+
+    async def _handle_commands(self, commands_data: Dict[str, Any]):
+        """명령 처리 파이프라인"""
+        for cmd_id, cmd in commands_data.items():
+            if not isinstance(cmd, dict) or cmd.get("processed", False):
+                continue
+
+            cmd_type = cmd.get("type")
+            logger.info(f"📩 [FirebaseBridge] 안드로이드 원격 명령 수신: {cmd_type} (ID: {cmd_id})")
+
+            try:
+                if cmd_type == "KILL_SWITCH":
+                    # 마스터 킬스위치 실행
+                    results = await self.orchestrator.master_kill_switch()
+                    self._mark_command_processed(cmd_id, status="SUCCESS", detail=results)
+
+                elif cmd_type == "TOGGLE_SLOT":
+                    slot_id = cmd.get("slot_id")
+                    is_active = cmd.get("is_active", True)
+                    if slot_id:
+                        await self.orchestrator.toggle_slot(slot_id, is_active)
+                        self._mark_command_processed(cmd_id, status="SUCCESS", detail=f"{slot_id}={is_active}")
+
+                elif cmd_type == "CLOSE_POSITION":
+                    slot_id = cmd.get("slot_id")
+                    ticker = cmd.get("ticker")
+                    if slot_id and ticker:
+                        trade = await self.orchestrator.close_slot_position(slot_id, ticker)
+                        self._mark_command_processed(
+                            cmd_id,
+                            status="SUCCESS" if trade else "FAILED",
+                            detail=trade.model_dump() if trade else "Position not found"
+                        )
+            except Exception as e:
+                logger.error(f"❌ [FirebaseBridge] 명령({cmd_type}) 처리 중 오류: {e}", exc_info=True)
+                self._mark_command_processed(cmd_id, status="ERROR", detail=str(e))
+
+    def _mark_command_processed(self, cmd_id: str, status: str, detail: Any):
+        """명령 완료 상태 기록"""
+        if self.mock_mode or not self.is_connected:
+            return
+        try:
+            ref = db.reference(f'/commands/{cmd_id}')
+            ref.update({
+                "processed": True,
+                "status": status,
+                "detail": detail,
+                "processed_at": datetime.now().isoformat()
+            })
+        except Exception as e:
+            logger.error(f"❌ [FirebaseBridge] 명령 상태 업데이트 실패: {e}")
+
+    async def _sync_loop(self):
+        """1~2초 주기 계좌 현황, 포지션, 마켓필터 Firebase RTDB 푸시"""
+        while self.is_running:
+            try:
+                if self.is_connected and not self.mock_mode:
+                    accounts = await self.orchestrator.ledger.get_accounts()
+                    positions = await self.orchestrator.ledger.get_positions()
+                    recent_trades = await self.orchestrator.ledger.get_recent_trades(limit=10)
+
+                    # 포트폴리오 종합 계산
+                    total_asset = sum(a.total_asset for a in accounts)
+                    total_cash = sum(a.cash_balance for a in accounts)
+                    total_stock = sum(a.stock_value for a in accounts)
+                    total_profit = sum(a.total_profit for a in accounts)
+                    initial_capital = sum(a.initial_capital for a in accounts)
+                    total_profit_rate = (total_profit / initial_capital) * 100.0 if initial_capital > 0 else 0.0
+
+                    payload = {
+                        "status": "ONLINE",
+                        "server_status": "ONLINE",
+                        "last_heartbeat": int(datetime.now().timestamp() * 1000),
+                        "portfolio": {
+                            "initial_capital": initial_capital,
+                            "total_asset": total_asset,
+                            "total_cash": total_cash,
+                            "total_stock": total_stock,
+                            "total_stock_value": total_stock,
+                            "total_profit": total_profit,
+                            "total_profit_rate": round(total_profit_rate, 2),
+                            "open_positions_count": len(positions),
+                            "updated_at": datetime.now().isoformat()
+                        },
+                        "market_filter": {
+                            "kospi_index": self.orchestrator.market_filter.kospi_index,
+                            "kospi_20ma": self.orchestrator.market_filter.kospi_20ma,
+                            "is_bear_market": self.orchestrator.market_filter.is_bear_market,
+                            "is_panic_sell_day": self.orchestrator.market_filter.is_panic_sell_day,
+                        },
+                        "slots": {
+                            acc.slot_id: {
+                                **acc.model_dump(mode='json'),
+                                "positions": [
+                                    p.model_dump(mode='json') for p in positions if p.slot_id == acc.slot_id
+                                ]
+                            }
+                            for acc in accounts
+                        },
+                        "recent_trades": [
+                            t.model_dump(mode='json') for t in recent_trades
+                        ],
+                        "intelligence": {
+                            "daily_review": getattr(self.orchestrator, "latest_daily_review", ""),
+                            "morning_briefing": getattr(self.orchestrator, "latest_morning_briefing", ""),
+                            "screening_candidates": getattr(self.orchestrator, "latest_screening_candidates", {}),
+                            "updated_at": datetime.now().isoformat()
+                        }
+                    }
+
+                    # Firebase RTDB에 한 번의 atomic update로 전송 (대역폭 및 쿼터 최소화, datetime 안전 직렬화)
+                    clean_payload = json.loads(json.dumps(payload, default=str))
+                    ref = db.reference('/system_status')
+                    ref.set(clean_payload)
+
+                await asyncio.sleep(1.5)  # 1.5초 주기 동기화
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ [FirebaseBridge] 동기화 루프 오류: {e}")
+                await asyncio.sleep(5)
+
+    def sync_app_version(
+        self,
+        version_code: int = 5,
+        version_name: str = "1.0.4",
+        apk_url: str = "https://github.com/kjun73/The_Stock/releases/download/v1.0.4/app-debug.apk",
+        notes: str = "15:40 AI 일일 결산 복기 및 장후 스크리닝 후보군 실시간 연동",
+        is_force: bool = False
+    ):
+        """안드로이드 인앱 자동 업데이트 메타데이터 동기화"""
+        if self.mock_mode or not self.is_connected:
+            return
+        try:
+            ref = db.reference('/app_version')
+            ref.set({
+                "versionCode": version_code,
+                "versionName": version_name,
+                "apkUrl": apk_url,
+                "notes": notes,
+                "isForce": is_force,
+                "updatedAt": datetime.now().isoformat()
+            })
+            logger.info("📱 [FirebaseBridge] /app_version 메타데이터 동기화 완료")
+        except Exception as e:
+            logger.warning(f"⚠️ [FirebaseBridge] /app_version 동기화 실패: {e}")

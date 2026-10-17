@@ -1,0 +1,25 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Sensitive credentials & Local DB
+.env
+firebase_credentials.json
+*.db
+*.sqlite3
+
+# Android build outputs
+android-app/**/build/
+android-app/.gradle/
+android-app/local.properties
+android-app/.idea/
+
+# Reports generated
+logs/

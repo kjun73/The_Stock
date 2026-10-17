@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- APK 다운로드 임시 캐시 경로 -->
+    <cache-path name="update_apk" path="updates/" />
+    <external-cache-path name="external_update_apk" path="updates/" />
+    <!-- 앱 내부 저장소 경로 -->
+    <files-path name="app_files" path="." />
+</paths>
