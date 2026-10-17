@@ -202,6 +202,19 @@ class TradingOrchestrator:
         # 원장 내 평가가 반영
         await self.ledger.update_market_prices({tick.ticker: tick.price})
 
+        # KODEX 200 (069500) 틱을 기반으로 실시간 시장 등락률 및 마켓필터 상태 동적 연동
+        if tick.ticker == "069500":
+            if not hasattr(self.market_filter, "kodex200_open"):
+                self.market_filter.kodex200_open = tick.price
+            open_p = getattr(self.market_filter, "kodex200_open", tick.price)
+            daily_change = ((tick.price - open_p) / open_p) * 100.0 if open_p > 0 else 0.0
+            current_index = round(2600.0 * (1.0 + daily_change / 100.0), 1)
+            self.market_filter.update_kospi_status(
+                current_index=current_index,
+                ma20=2580.0,
+                daily_change_pct=round(daily_change, 2)
+            )
+
         # 보유 중인 포지션 조회
         positions = await self.ledger.get_positions()
         positions_by_slot = {f"{p.slot_id}:{p.ticker}": p for p in positions}

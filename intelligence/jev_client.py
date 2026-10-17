@@ -59,10 +59,11 @@ class JevCascadeClient:
         self,
         ticker: str,
         tick: TickData,
-        target_price: float
+        target_price: float,
+        surge_ratio: float = 2.5
     ) -> Tuple[bool, float, str]:
         """
-        2단계 OpenRouter typesafe/jev-1.13 API 호출:
+        2단계 OpenRouter typesafe/jev-1.13 API 호출 (Decisions 엔드포인트):
         - 반환: (is_approved, fakeout_prob, reason)
         - 700ms 타임아웃 초과 시 Safe Reject (안전 진입 거절)
         """
@@ -77,7 +78,7 @@ class JevCascadeClient:
         if self.circuit_broken:
             return False, 1.0, "CIRCUIT_BREAKER_ACTIVE_SAFE_REJECT"
 
-        url = "https://openrouter.ai/api/v1/chat/completions"
+        url = "https://openrouter.ai/api/alpha/decisions"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -85,25 +86,29 @@ class JevCascadeClient:
             "X-Title": "The Stock JEV Fast Decision",
         }
 
-        # 정량 데이터만 담은 경량 JSON 프롬프트 구성
+        breakout_pct = ((tick.price - target_price) / target_price) * 100.0 if target_price > 0 else 0.0
+
+        # TypeSafe JEV 1.13 Decisions API 규격 페이로드 구성
         payload = {
             "model": "typesafe/jev-1.13",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        f"Evaluate fakeout probability for stock breakout:\n"
-                        f"- Ticker: {ticker}\n"
-                        f"- Current Price: {tick.price}\n"
-                        f"- Target Price: {target_price}\n"
-                        f"- Execution Strength: {tick.exec_strength}%\n"
-                        f"- Bid/Ask Ratio: {tick.bid_ask_ratio}\n"
-                        f"Output JSON strictly with field 'fakeout_probability' (0.0 to 1.0)."
-                    )
+            "state": (
+                f"Stock Breakout Evaluation:\n"
+                f"- Ticker: {ticker}\n"
+                f"- Current Price: {tick.price:.1f} KRW (+{breakout_pct:.1f}% breakout above target {target_price:.1f} KRW)\n"
+                f"- Execution Strength: {tick.exec_strength:.1f}% (strong buying order flow)\n"
+                f"- Volume Surge: {surge_ratio:.1f}x of 20-minute average volume\n"
+                f"- Bid/Ask Ratio: {tick.bid_ask_ratio:.2f}"
+            ),
+            "questions": {
+                "is_fakeout": {
+                    "type": "noul",
+                    "instructions": "Is this stock price breakout a fakeout trap?",
+                    "criteria": {
+                        "true": "Fakeout trap, false breakout, artificial spike without real demand, imminent dump",
+                        "false": "Genuine breakout with solid buying support, high volume surge, and strong order book balance"
+                    }
                 }
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"}
+            }
         }
 
         start_t = time.monotonic()
@@ -116,10 +121,11 @@ class JevCascadeClient:
                 if res.status_code == 200:
                     self.consecutive_failures = 0
                     result_json = res.json()
-                    content = result_json["choices"][0]["message"]["content"]
-                    import json
-                    parsed = json.loads(content)
-                    fakeout_prob = float(parsed.get("fakeout_probability", 0.5))
+                    # OpenRouter /api/alpha/decisions 응답 형식 파싱:
+                    # {"answers": {"is_fakeout": {"type": "noul", "noul": 0.18}}}
+                    answers = result_json.get("answers", {})
+                    fakeout_info = answers.get("is_fakeout", {})
+                    fakeout_prob = float(fakeout_info.get("noul", 0.5))
 
                     is_approved = fakeout_prob < 0.25
                     reason = f"JEV_OK_{elapsed_ms:.0f}ms_PROB_{fakeout_prob:.2f}"
@@ -128,7 +134,7 @@ class JevCascadeClient:
                     self.cooldown_tracker[ticker] = time.time()
                     return is_approved, fakeout_prob, reason
                 else:
-                    raise RuntimeError(f"HTTP_{res.status_code}")
+                    raise RuntimeError(f"HTTP_{res.status_code}_{res.text}")
 
         except (httpx.TimeoutException, asyncio.TimeoutError):
             logger.warning(f"⚡ [JEV 타임아웃 {settings.JEV_TIMEOUT_MS}ms 초과] {ticker} -> Safe Reject 적용")

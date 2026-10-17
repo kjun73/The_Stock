@@ -134,3 +134,66 @@ async def test_pre_market_hours_block():
         assert sig_d is None, "장전/장후에는 슬롯 D 신규 매수가 차단되어야 합니다"
 
 
+@pytest.mark.asyncio
+async def test_slot_a_split_buy_2():
+    """슬롯 A: D일 진입 후 09:15~10:00 사이 잔여 50% 2차 분할 매수 검증"""
+    slot_a = SlotAInstitutionalSwing()
+    # 1차 매수된 포지션 (165만 원 보유, holding_days = 0)
+    pos = SlotPosition(
+        slot_id="SLOT_A",
+        ticker="005930",
+        asset_type="STOCK",
+        quantity=7,
+        entry_price=211700.0,
+        current_price=212000.0,
+        stop_loss_price=204000.0,
+        take_profit_price=224000.0,
+        holding_days=0
+    )
+    tick = TickData(ticker="005930", price=212000.0, ask_price=212500.0, bid_price=211500.0)
+
+    # 09:20 시점 가정
+    from unittest.mock import patch
+    with patch("strategies.slot_a_institutional_swing.datetime") as mock_dt:
+        mock_dt.now.return_value = datetime(2026, 10, 16, 9, 20, 0)
+        sig = await slot_a.evaluate_market(tick, pos)
+        assert sig is not None
+        assert sig.action == "BUY"
+        assert sig.order_type == "SPLIT_BUY_2"
+        assert sig.quantity > 0
+
+
+@pytest.mark.asyncio
+async def test_slot_d_dynamic_support_calibration():
+    """슬롯 D: 지지선이 현재가와 괴리되어 있을 때 실시간 시세 기준으로 자동 캘리브레이션 검증"""
+    slot_d = SlotDRetestSwing()
+    slot_d.bypass_time_filter = True
+    # 현재가 217,000원인 삼성전자 유입 (하드코딩된 78,000원과 64% 괴리)
+    tick = TickData(ticker="005930", price=217000.0, ask_price=217200.0, bid_price=216800.0)
+    sig = await slot_d.evaluate_market(tick, None)
+    # 지지선이 217000 * 0.98 = 212,660원으로 캘리브레이션 되었는지 확인
+    assert slot_d.support_levels["005930"] == pytest.approx(217000.0 * 0.98, rel=1e-2)
+
+
+@pytest.mark.asyncio
+async def test_slot_c_dynamic_breakout():
+    """슬롯 C: 시초가 기록 후 +1% 돌파 시 변동성 돌파 시그널 및 JEV 가드레일 정상 통과 검증"""
+    from intelligence.jev_client import JevCascadeClient
+    jev = JevCascadeClient()
+    slot_c = SlotCVolatilityBreakout(jev_client=jev)
+    slot_c.bypass_time_filter = True
+
+    # 1. 시초가 200,000원 틱 유입
+    tick_open = TickData(ticker="005930", price=200000.0, ask_price=200200.0, bid_price=199800.0, volume=1000, exec_strength=105.0)
+    sig1 = await slot_c.evaluate_market(tick_open, None)
+    assert sig1 is None  # 아직 미돌파 및 체결강도 미달
+
+    # 2. 시초가 대비 +1.5% 돌파(203,000원) + 체결강도 125% + 거래량 급증 틱 유입
+    tick_breakout = TickData(ticker="005930", price=203000.0, ask_price=203200.0, bid_price=202800.0, volume=5000, exec_strength=125.0)
+    sig2 = await slot_c.evaluate_market(tick_breakout, None)
+    assert sig2 is not None
+    assert sig2.action == "BUY"
+    assert sig2.order_type == "MARKET_BREAKOUT"
+
+
+

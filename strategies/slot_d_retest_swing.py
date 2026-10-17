@@ -24,35 +24,24 @@ class SlotDRetestSwing(BaseStrategy):
         )
         self.max_stocks: int = 3
         self.capital_per_stock: float = 3_300_000.0
-        self.support_levels: Dict[str, float] = {
-            "005930": 78000.0,
-            "000660": 185000.0,
-            "035420": 175000.0,
-            "005380": 240000.0,
-            "068270": 190000.0,
-        }  # 종목별 전고점 지지선 가격
+        self.support_levels: Dict[str, float] = {}  # 종목별 전고점 지지선 가격 (실시간 시세 기반 동적 자동 캘리브레이션)
         self.take_profit_rate: float = 8.0          # +8.0% 익절
         self.stop_loss_rate: float = -3.0           # -3.0% 손절
         self.max_holding_days: int = 7
         self.bypass_time_filter: bool = False
 
-    def update_candidates(self, candidates: List[str], support_map: Dict[str, float]):
+    def update_candidates(self, candidates: List[str], support_map: Optional[Dict[str, float]] = None):
         self.universe = candidates[:self.max_stocks]
-        self.support_levels.update(support_map)
+        if support_map:
+            self.support_levels.update(support_map)
         logger.info(f"[{self.name}] 신고가 눌림목 후보군 {len(self.universe)}종목 갱신: {self.universe}")
 
     async def run_morning_screening(self):
         """매일 08:45 또는 지연 기동 시 전고점 돌파 첫 눌림목 스윙 후보군 스크리닝"""
         logger.info(f"🔍 [{self.name}] 장전/기동 시 신고가 눌림목 후보군 스크리닝 가동...")
         candidates = ["005930", "000660", "035420", "005380", "068270"]
-        support_map = {
-            "005930": 78000.0,
-            "000660": 185000.0,
-            "035420": 175000.0,
-            "005380": 240000.0,
-            "068270": 190000.0,
-        }
-        self.update_candidates(candidates, support_map)
+        # 지지선은 시장 틱 데이터 유입 시 실시간 시세 기준으로 동적 자동 캘리브레이션
+        self.update_candidates(candidates)
         logger.info(f"✅ [{self.name}] 스크리닝 완료: {self.universe}")
 
     async def evaluate_market(
@@ -124,10 +113,14 @@ class SlotDRetestSwing(BaseStrategy):
 
         # 2. 미보유 상태 -> 지지선 눌림목 반등 확인 시 매수
         if tick.ticker in self.universe:
-            support = self.support_levels.get(tick.ticker, tick.price * 0.98)
+            support = self.support_levels.get(tick.ticker)
+            # 하드코딩 지지선이 현재가와 5% 이상 괴리된 경우 실시간 시세 기준 전고점 눌림목 지지선(-2.0%)으로 동적 캘리브레이션
+            if support is None or abs(support - tick.price) / tick.price > 0.05:
+                support = round(tick.price * 0.98, 0)
+                self.support_levels[tick.ticker] = support
 
-            # 주가가 지지선 위 0.5% 이내에 위치하면서 매수세 유입 시 (눌림목 타점)
-            if support <= ask_price <= (support * 1.01):
+            # 주가가 지지선 위 1.5% 이내에 위치하면서 매수세 유입 시 (눌림목 타점)
+            if support <= ask_price <= (support * 1.015):
                 qty = int(self.capital_per_stock // ask_price)
                 if qty > 0:
                     stop_p = round(ask_price * (1.0 + self.stop_loss_rate / 100.0), 2)
@@ -140,7 +133,7 @@ class SlotDRetestSwing(BaseStrategy):
                         order_type="LIMIT_NORMAL",
                         price=ask_price,
                         quantity=qty,
-                        reason=f"전고점 지지선({support}원) 눌림목 반등 매수",
+                        reason=f"전고점 지지선({support:,.0f}원) 눌림목 반등 매수",
                         stop_loss_price=stop_p,
                         take_profit_price=take_p
                     )

@@ -58,8 +58,15 @@ class SlotBBollingerGrid(BaseStrategy):
             return None
 
         band = self.bands.get(tick.ticker)
-        if not band:
-            return None
+        # 밴드가 없거나 현재 시세와 15% 이상 괴리된 경우 현재가 기준 20MA 중심선 및 ±3%(2시그마 대역) 동적 적응
+        if not band or abs(band["middle"] - tick.price) / tick.price > 0.15:
+            mid = tick.price
+            self.bands[tick.ticker] = {
+                "upper": round(mid * 1.03, 1),
+                "middle": mid,
+                "lower": round(mid * 0.97, 1)
+            }
+            band = self.bands[tick.ticker]
 
         lower = band["lower"]
         middle = band["middle"]

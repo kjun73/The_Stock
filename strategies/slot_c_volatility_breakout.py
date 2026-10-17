@@ -115,9 +115,17 @@ class SlotCVolatilityBreakout(BaseStrategy):
         if not self.bypass_time_filter and (current_time >= dtime(14, 30) or current_time < dtime(9, 5)):
             return None
 
-        target_price = self.target_prices.get(tick.ticker, tick.price * 1.02)
+        # 종목별 당일 시초가 기록 및 변동성 돌파 목표가 산출
+        if not hasattr(self, "open_prices"):
+            self.open_prices = {}
+        if tick.ticker not in self.open_prices:
+            self.open_prices[tick.ticker] = tick.price
+
+        open_p = self.open_prices[tick.ticker]
+        # 래리 윌리엄스 변동성 돌파: 시초가 대비 +1.0% 상승 돌파 시 매수 신호
+        target_price = self.target_prices.get(tick.ticker, round(open_p * 1.01, 2))
         avg_vol = self.avg_volumes.get(tick.ticker, 1000.0)
-        vol_1m = self.recent_1m_volumes.get(tick.ticker, 3000.0)
+        vol_1m = self.recent_1m_volumes.get(tick.ticker, max(float(tick.volume), 3000.0))
 
         # 1단계: 로컬 정량 필터 (0.1ms, $0)
         passed_stage1, reason1 = self.jev_client.check_stage1_filter(
@@ -130,10 +138,12 @@ class SlotCVolatilityBreakout(BaseStrategy):
             return None
 
         # 2단계: JEV 1.13 초고속 API 호출 (700ms 타임아웃)
+        surge_ratio = vol_1m / max(avg_vol, 1.0)
         is_approved, fakeout_prob, reason2 = await self.jev_client.evaluate_stage2_jev(
             ticker=tick.ticker,
             tick=tick,
-            target_price=target_price
+            target_price=target_price,
+            surge_ratio=surge_ratio
         )
 
         if is_approved:
