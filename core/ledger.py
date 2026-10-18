@@ -147,6 +147,32 @@ class SqliteLedger:
                 ))
             return accounts
 
+    async def get_slot_account(self, slot_id: str) -> Optional[SlotAccount]:
+        """특정 슬롯 계좌 현황 단일 조회"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM slot_accounts WHERE slot_id = ?", (slot_id,))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            c_pos = await db.execute(
+                "SELECT COUNT(*) FROM slot_positions WHERE slot_id = ?",
+                (slot_id,)
+            )
+            pos_count = (await c_pos.fetchone())[0]
+            return SlotAccount(
+                slot_id=row["slot_id"],
+                name=row["name"],
+                initial_capital=row["initial_capital"],
+                cash_balance=row["cash_balance"],
+                stock_value=row["stock_value"],
+                total_asset=row["total_asset"],
+                total_profit=row["total_profit"],
+                profit_rate=row["profit_rate"],
+                is_active=bool(row["is_active"]),
+                active_positions_count=pos_count
+            )
+
     async def get_positions(self, slot_id: Optional[str] = None) -> List[SlotPosition]:
         """보유 포지션 조회"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -416,6 +442,15 @@ class SqliteLedger:
             )
             await db.commit()
 
+    async def update_stop_loss_price(self, slot_id: str, ticker: str, new_stop_loss_price: float):
+        """보유 포지션의 손절가를 상향(Breakeven 또는 Trailing) 갱신"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE slot_positions SET stop_loss_price = ? WHERE slot_id = ? AND ticker = ?",
+                (new_stop_loss_price, slot_id, ticker)
+            )
+            await db.commit()
+
     async def get_recent_trades(
         self,
         slot_id: Optional[str] = None,
@@ -494,6 +529,53 @@ class SqliteLedger:
                     exit_reason=r["exit_reason"]
                 ))
             return trades
+
+    async def compute_half_kelly_capital(
+        self,
+        slot_id: str,
+        days: int = 10,
+        default_capital: float = 2_500_000.0,
+        min_ratio: float = 0.10,
+        max_ratio: float = 0.30
+    ) -> float:
+        """
+        최근 days영업일 체결 내역 기반 Half-Kelly 동적 포지션 사이징 계산:
+        - Win Rate(W)와 Payoff Ratio(R)을 산출하여 Kelly Fraction f* 계산
+        - f_half = 0.5 * f*
+        - 가용 예수금에 곱하여 10% ~ 30% 범위로 클램핑된 배정 금액 반환
+        - 표본이 적거나(5건 미만) 기대값이 마이너스일 때는 default_capital 또는 min_ratio(10%) 적용
+        """
+        trades = await self.get_trades_for_days(days, slot_id=slot_id)
+        if len(trades) < 5:
+            return default_capital
+
+        wins = [t for t in trades if t.net_pnl > 0]
+        losses = [t for t in trades if t.net_pnl < 0]
+
+        win_count = len(wins)
+        loss_count = len(losses)
+        total_count = len(trades)
+
+        w = win_count / total_count if total_count > 0 else 0.0
+        avg_gain = (sum(t.net_pnl for t in wins) / win_count) if win_count > 0 else 0.0
+        avg_loss = (abs(sum(t.net_pnl for t in losses)) / loss_count) if loss_count > 0 else 0.0
+
+        r = (avg_gain / avg_loss) if avg_loss > 0 else 1.0
+
+        if r <= 0:
+            kelly_f = 0.0
+        else:
+            kelly_f = w - ((1.0 - w) / r)
+
+        half_kelly = 0.5 * kelly_f
+        clamped_ratio = max(min_ratio, min(half_kelly, max_ratio))
+
+        account = await self.get_slot_account(slot_id)
+        if not account or account.cash_balance <= 0:
+            return default_capital
+
+        allocated_capital = round(account.cash_balance * clamped_ratio, -4)
+        return max(1_000_000.0, allocated_capital)
 
     async def save_daily_settlement(
         self,

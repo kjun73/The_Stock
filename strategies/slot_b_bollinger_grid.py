@@ -40,6 +40,44 @@ class SlotBBollingerGrid(BaseStrategy):
         """일봉/분봉 기반 계산된 볼린저 밴드 갱신"""
         self.bands[ticker] = {"upper": upper, "middle": middle, "lower": lower}
 
+    def calculate_bollinger_bands_from_history(self, ticker: str) -> Optional[Dict[str, float]]:
+        """pykrx 최근 20영업일 종가 데이터 기반 정밀 볼린저 밴드(20, 2) 계산"""
+        try:
+            from pykrx import stock
+            from datetime import timedelta
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
+            df = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
+            if df is not None and len(df) >= 20:
+                closes = df["종가"].tail(20)
+                ma20 = float(closes.mean())
+                std20 = float(closes.std())
+                upper = round(ma20 + (2.0 * std20), 1)
+                lower = round(ma20 - (2.0 * std20), 1)
+                middle = round(ma20, 1)
+                self.bands[ticker] = {"upper": upper, "middle": middle, "lower": lower}
+                logger.info(f"📊 [{self.name}] {ticker} pykrx 실증 볼린저 밴드(20, 2) 산출 완료: 상단 {upper} / 중심 {middle} / 하단 {lower}")
+                return self.bands[ticker]
+        except Exception as e:
+            logger.info(f"[{self.name}] pykrx 볼린저 밴드 계산 폴백 ({ticker}): {e}")
+        return None
+
+    def get_bands(self, ticker: str, current_price: Optional[float] = None) -> Dict[str, float]:
+        """볼린저 밴드 조회 (없거나 괴리율이 클 경우 pykrx 실증 계산 또는 동적 적응)"""
+        band = self.bands.get(ticker)
+        if current_price and current_price > 0:
+            if not band or abs(band["middle"] - current_price) / current_price > 0.10:
+                band = self.calculate_bollinger_bands_from_history(ticker)
+                if not band:
+                    mid = current_price
+                    self.bands[ticker] = {
+                        "upper": round(mid * 1.03, 1),
+                        "middle": mid,
+                        "lower": round(mid * 0.97, 1)
+                    }
+                    band = self.bands[ticker]
+        return band or {"upper": 0.0, "middle": 0.0, "lower": 0.0}
+
     async def evaluate_market(
         self,
         tick: TickData,
@@ -57,17 +95,7 @@ class SlotBBollingerGrid(BaseStrategy):
         if tick.ticker not in self.universe:
             return None
 
-        band = self.bands.get(tick.ticker)
-        # 밴드가 없거나 현재 시세와 15% 이상 괴리된 경우 현재가 기준 20MA 중심선 및 ±3%(2시그마 대역) 동적 적응
-        if not band or abs(band["middle"] - tick.price) / tick.price > 0.15:
-            mid = tick.price
-            self.bands[tick.ticker] = {
-                "upper": round(mid * 1.03, 1),
-                "middle": mid,
-                "lower": round(mid * 0.97, 1)
-            }
-            band = self.bands[tick.ticker]
-
+        band = self.get_bands(tick.ticker, tick.price)
         lower = band["lower"]
         middle = band["middle"]
         upper = band["upper"]

@@ -24,10 +24,14 @@ class SlotAInstitutionalSwing(BaseStrategy):
         )
         self.max_stocks: int = 3
         self.target_capital_per_stock: float = 3_300_000.0
-        self.take_profit_rate: float = 6.0    # +6.0% 익절
-        self.stop_loss_rate: float = -3.5     # -3.5% 손절
+        self.take_profit_rate: float = 6.0    # +6.0% 최종 전량 익절
+        self.partial_tp_rate: float = 3.0     # +3.0% 도달 시 50% 1차 분할 익절
+        self.stop_loss_rate: float = -3.5     # 초기 손절선 -3.5%
         self.max_holding_days: int = 5
         self.split_buy_tracker: Dict[str, int] = {}
+        self.partial_tp_tracker: Dict[str, bool] = {}    # 1차 익절 완료 여부 추적
+        self.breakeven_tracker: Dict[str, bool] = {}     # 손절선 본전 상향 여부 추적
+        self.bypass_time_filter: bool = False
 
     def update_candidates(self, candidates: List[str]):
         """D일 15:40 스크리닝된 종목 리스트 갱신"""
@@ -55,14 +59,35 @@ class SlotAInstitutionalSwing(BaseStrategy):
         if ask_price <= 0 or bid_price <= 0:
             return None
 
-        # 1. 이미 보유 중인 경우 -> 청산 조건(익절, 손절, 5일 만기) 검사
+        # 1. 이미 보유 중인 경우 -> 청산 조건(1차 분할익절, 최종익절, 본전보존/손절, 5일 만기) 검사
         if current_position:
             # 평가 수익률 계산
             pnl_rate = ((bid_price - current_position.entry_price) / current_position.entry_price) * 100.0
 
-            # (1) 목표 익절 (+6.0%)
+            # (1) 1차 50% 분할 익절 (+3.0% 도달 시) & 손절선 본전(0.0%) 상향
+            if pnl_rate >= self.partial_tp_rate and not self.partial_tp_tracker.get(tick.ticker, False):
+                if current_position.quantity >= 2:
+                    sell_qty = max(1, current_position.quantity // 2)
+                    self.partial_tp_tracker[tick.ticker] = True
+                    self.breakeven_tracker[tick.ticker] = True
+                    logger.info(f"🎯 [{self.name}] {tick.ticker} +{pnl_rate:.2f}% 도달 -> 1차 50%({sell_qty}주) 분할 익절 및 손절선 본전 상향")
+                    return Signal(
+                        slot_id=self.slot_id,
+                        ticker=tick.ticker,
+                        asset_type="STOCK",
+                        action="SELL",
+                        order_type="LIMIT_NORMAL",
+                        price=bid_price,
+                        quantity=sell_qty,
+                        reason=f"수급 스윙 1차 50% 분할 익절 (+{pnl_rate:.2f}%) 및 손절선 본전 상향",
+                        exit_reason="STRATEGY_PARTIAL_TP"
+                    )
+
+            # (2) 최종 목표 익절 (+6.0% 이상 도달 시 잔여 수량 전량 익절)
             if pnl_rate >= self.take_profit_rate:
                 self.split_buy_tracker[tick.ticker] = 0
+                self.partial_tp_tracker.pop(tick.ticker, None)
+                self.breakeven_tracker.pop(tick.ticker, None)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
@@ -71,28 +96,50 @@ class SlotAInstitutionalSwing(BaseStrategy):
                     order_type="LIMIT_NORMAL",
                     price=bid_price,
                     quantity=current_position.quantity,
-                    reason=f"목표 익절 도달 (+{pnl_rate:.2f}%)",
+                    reason=f"목표 최종 익절 도달 (+{pnl_rate:.2f}%)",
                     exit_reason="STRATEGY_TAKE_PROFIT"
                 )
 
-            # (2) 손절 (-3.5%)
-            if pnl_rate <= self.stop_loss_rate:
-                self.split_buy_tracker[tick.ticker] = 0
-                return Signal(
-                    slot_id=self.slot_id,
-                    ticker=tick.ticker,
-                    asset_type="STOCK",
-                    action="SELL",
-                    order_type="LIMIT_NORMAL",
-                    price=bid_price,
-                    quantity=current_position.quantity,
-                    reason=f"손절선 이탈 ({pnl_rate:.2f}%)",
-                    exit_reason="STRATEGY_STOP_LOSS"
-                )
+            # (3) 손절 로직: 1차 익절 완료 시 본전(0.0%) 보존, 미완료 시 초기 손절(-3.5%)
+            is_breakeven_active = self.breakeven_tracker.get(tick.ticker, False)
+            if is_breakeven_active:
+                if pnl_rate <= 0.0:
+                    self.split_buy_tracker[tick.ticker] = 0
+                    self.partial_tp_tracker.pop(tick.ticker, None)
+                    self.breakeven_tracker.pop(tick.ticker, None)
+                    return Signal(
+                        slot_id=self.slot_id,
+                        ticker=tick.ticker,
+                        asset_type="STOCK",
+                        action="SELL",
+                        order_type="LIMIT_NORMAL",
+                        price=bid_price,
+                        quantity=current_position.quantity,
+                        reason=f"1차 익절 후 본전(0.0%) 보존 손절 발동 ({pnl_rate:.2f}%)",
+                        exit_reason="STRATEGY_BREAKEVEN_STOP"
+                    )
+            else:
+                if pnl_rate <= self.stop_loss_rate:
+                    self.split_buy_tracker[tick.ticker] = 0
+                    self.partial_tp_tracker.pop(tick.ticker, None)
+                    self.breakeven_tracker.pop(tick.ticker, None)
+                    return Signal(
+                        slot_id=self.slot_id,
+                        ticker=tick.ticker,
+                        asset_type="STOCK",
+                        action="SELL",
+                        order_type="LIMIT_NORMAL",
+                        price=bid_price,
+                        quantity=current_position.quantity,
+                        reason=f"손절선 이탈 ({pnl_rate:.2f}%)",
+                        exit_reason="STRATEGY_STOP_LOSS"
+                    )
 
-            # (3) 보유 기한 만기 (5영업일 경과 & 15:15 이후)
-            if current_position.holding_days >= self.max_holding_days and current_time >= dtime(15, 15):
+            # (4) 보유 기한 만기 (5영업일 경과 & 15:15 이후)
+            if current_position.holding_days >= self.max_holding_days and (self.bypass_time_filter or current_time >= dtime(15, 15)):
                 self.split_buy_tracker[tick.ticker] = 0
+                self.partial_tp_tracker.pop(tick.ticker, None)
+                self.breakeven_tracker.pop(tick.ticker, None)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,

@@ -40,10 +40,10 @@ def test_market_filter_rules():
 
 @pytest.mark.asyncio
 async def test_slot_a_tp_and_sl():
-    """슬롯 A: 익절 +6.0%, 손절 -3.5% 트리거 검증"""
+    """슬롯 A: 1차 분할익절(+3.0%), 본전보존(0.0%), 최종익절(+6.0%), 초기손절(-3.5%) 검증"""
     slot_a = SlotAInstitutionalSwing()
 
-    # 보유 포지션 설정 (진입가 100,000원)
+    # 보유 포지션 설정 (진입가 100,000원, 30주)
     pos = SlotPosition(
         slot_id="SLOT_A",
         ticker="005930",
@@ -55,16 +55,47 @@ async def test_slot_a_tp_and_sl():
         take_profit_price=106_000.0  # +6.0%
     )
 
-    # 1. 익절 시그널 (+6.0% 이상 도달)
+    # 1. 1차 50% 분할 익절 (+3.0% 이상 도달 시 15주 분할 매도)
+    tick_partial = TickData(ticker="005930", price=103_200.0, bid_price=103_200.0, ask_price=103_300.0)
+    sig_partial = await slot_a.evaluate_market(tick_partial, pos)
+    assert sig_partial is not None
+    assert sig_partial.action == "SELL"
+    assert sig_partial.exit_reason == "STRATEGY_PARTIAL_TP"
+    assert sig_partial.quantity == 15  # 30주의 50%인 15주 매도
+    assert slot_a.partial_tp_tracker["005930"] is True
+    assert slot_a.breakeven_tracker["005930"] is True
+
+    # 2. 1차 분할 익절 후 잔여 수량(15주) 상태에서 최종 익절 (+6.0% 도달)
+    pos_rem = SlotPosition(
+        slot_id="SLOT_A",
+        ticker="005930",
+        asset_type="STOCK",
+        quantity=15,
+        entry_price=100_000.0,
+        current_price=106_200.0,
+        stop_loss_price=100_000.0,
+        take_profit_price=106_000.0
+    )
     tick_tp = TickData(ticker="005930", price=106_200.0, bid_price=106_200.0, ask_price=106_300.0)
-    sig_tp = await slot_a.evaluate_market(tick_tp, pos)
+    sig_tp = await slot_a.evaluate_market(tick_tp, pos_rem)
     assert sig_tp is not None
     assert sig_tp.action == "SELL"
     assert sig_tp.exit_reason == "STRATEGY_TAKE_PROFIT"
+    assert sig_tp.quantity == 15
 
-    # 2. 손절 시그널 (-3.5% 이하 이탈)
+    # 3. 1차 분할 익절 후 지수 반락으로 본전(100,000원 이하) 이탈 시 본전 보존 손절 검증
+    slot_a_be = SlotAInstitutionalSwing()
+    slot_a_be.partial_tp_tracker["005930"] = True
+    slot_a_be.breakeven_tracker["005930"] = True
+    tick_be = TickData(ticker="005930", price=99_800.0, bid_price=99_800.0, ask_price=99_900.0)
+    sig_be = await slot_a_be.evaluate_market(tick_be, pos_rem)
+    assert sig_be is not None
+    assert sig_be.exit_reason == "STRATEGY_BREAKEVEN_STOP"
+
+    # 4. 1차 익절 전 초기 손절 (-3.5% 이하 이탈)
+    slot_a_sl = SlotAInstitutionalSwing()
     tick_sl = TickData(ticker="005930", price=96_400.0, bid_price=96_400.0, ask_price=96_500.0)
-    sig_sl = await slot_a.evaluate_market(tick_sl, pos)
+    sig_sl = await slot_a_sl.evaluate_market(tick_sl, pos)
     assert sig_sl is not None
     assert sig_sl.action == "SELL"
     assert sig_sl.exit_reason == "STRATEGY_STOP_LOSS"
@@ -194,6 +225,128 @@ async def test_slot_c_dynamic_breakout():
     assert sig2 is not None
     assert sig2.action == "BUY"
     assert sig2.order_type == "MARKET_BREAKOUT"
+
+
+@pytest.mark.asyncio
+async def test_slot_c_trailing_stop():
+    """슬롯 C: +1.5% 돌파 시 트레일링 활성화 및 고점 대비 -1.0% 반락 시 익절 확정 검증"""
+    from intelligence.jev_client import JevCascadeClient
+    jev = JevCascadeClient()
+    slot_c = SlotCVolatilityBreakout(jev_client=jev)
+    slot_c.bypass_time_filter = True
+
+    pos = SlotPosition(
+        slot_id="SLOT_C",
+        ticker="005930",
+        asset_type="STOCK",
+        quantity=10,
+        entry_price=200_000.0,
+        current_price=200_000.0,
+        stop_loss_price=194_400.0  # -2.8%
+    )
+
+    # 1. +2.0% 상승(204,000원) -> 트레일링 모드 활성화 (+1.5% 초과), 청산은 미발생
+    tick1 = TickData(ticker="005930", price=204000.0, bid_price=204000.0, ask_price=204200.0)
+    sig1 = await slot_c.evaluate_market(tick1, pos)
+    assert sig1 is None
+    assert slot_c.trailing_active["005930"] is True
+    assert slot_c.high_watermarks["005930"] == 204000.0
+
+    # 2. +3.0% 추가 상승(206,000원) -> 최고가 206,000원으로 갱신
+    tick2 = TickData(ticker="005930", price=206000.0, bid_price=206000.0, ask_price=206200.0)
+    sig2 = await slot_c.evaluate_market(tick2, pos)
+    assert sig2 is None
+    assert slot_c.high_watermarks["005930"] == 206000.0
+
+    # 3. 최고가(206,000원) 대비 -1.1% 반락 (203,700원) -> 트레일링 스탑 익절 발동!
+    tick3 = TickData(ticker="005930", price=203700.0, bid_price=203700.0, ask_price=203900.0)
+    sig3 = await slot_c.evaluate_market(tick3, pos)
+    assert sig3 is not None
+    assert sig3.action == "SELL"
+    assert sig3.exit_reason == "STRATEGY_TRAILING_STOP"
+    assert "트레일링 익절 발동" in sig3.reason
+
+    # 4. 트레일링 활성화 전 -2.8% 이하로 하락 시 절대 손절 발동 검증
+    slot_c_sl = SlotCVolatilityBreakout(jev_client=jev)
+    slot_c_sl.bypass_time_filter = True
+    tick_sl = TickData(ticker="005930", price=194300.0, bid_price=194300.0, ask_price=194400.0)
+    sig_sl = await slot_c_sl.evaluate_market(tick_sl, pos)
+    assert sig_sl is not None
+    assert sig_sl.exit_reason == "STRATEGY_STOP_LOSS"
+
+
+@pytest.mark.asyncio
+async def test_slot_d_trailing_stop_and_breakeven():
+    """슬롯 D: +3.5% 도달 시 트레일링 활성화, -1.5% 반락 시 익절 및 본전 보존 검증"""
+    slot_d = SlotDRetestSwing()
+    slot_d.bypass_time_filter = True
+
+    pos = SlotPosition(
+        slot_id="SLOT_D",
+        ticker="005930",
+        asset_type="STOCK",
+        quantity=15,
+        entry_price=100_000.0,
+        current_price=100_000.0,
+        stop_loss_price=97_000.0  # -3.0%
+    )
+
+    # 1. +4.0% 상승 (104,000원) -> 트레일링 활성화
+    tick1 = TickData(ticker="005930", price=104000.0, bid_price=104000.0, ask_price=104100.0)
+    sig1 = await slot_d.evaluate_market(tick1, pos)
+    assert sig1 is None
+    assert slot_d.trailing_active["005930"] is True
+    assert slot_d.high_watermarks["005930"] == 104000.0
+
+    # 2. 최고가(104,000원) 대비 -1.6% 반락 (102,300원) -> 트레일링 익절 발동
+    tick2 = TickData(ticker="005930", price=102300.0, bid_price=102300.0, ask_price=102400.0)
+    sig2 = await slot_d.evaluate_market(tick2, pos)
+    assert sig2 is not None
+    assert sig2.exit_reason == "STRATEGY_TRAILING_STOP"
+    assert sig2.action == "SELL"
+
+
+def test_market_filter_update_from_kodex200():
+    """KODEX 200 실시간 틱 기반 마켓필터 동적 연동 검증"""
+    filter_mgr = MarketFilterManager(base_index=2600.0, ma20=2580.0)
+
+    # 1. 시초 틱 등록 (open=35,000)
+    filter_mgr.update_from_kodex200(35000.0)
+    assert filter_mgr.kodex200_open == 35000.0
+    assert filter_mgr.kospi_daily_change_pct == 0.0
+    assert filter_mgr.kospi_index == 2600.0
+
+    # 2. +1.0% 상승 틱 (35,350)
+    filter_mgr.update_from_kodex200(35350.0)
+    assert filter_mgr.kospi_daily_change_pct == 1.0
+    assert filter_mgr.kospi_index == 2626.0
+    assert filter_mgr.is_bear_market is False
+
+    # 3. -3.5% 급락 틱 (33,775) -> 패닉셀 발동
+    filter_mgr.update_from_kodex200(33775.0)
+    assert filter_mgr.kospi_daily_change_pct == -3.5
+    assert filter_mgr.is_panic_sell_day is True
+    assert filter_mgr.can_enter("SLOT_B") is False
+
+
+def test_slot_b_and_d_dynamic_attributes():
+    """슬롯 B 동적 밴드 및 슬롯 D selected_candidates 속성 무결성 검증"""
+    slot_b = SlotBBollingerGrid()
+    # 1. 069500 실제 또는 캐시 밴드 확인
+    bands = slot_b.get_bands("069500", current_price=50000.0)
+    assert bands["lower"] < bands["middle"] < bands["upper"]
+    assert bands["middle"] > 0
+
+    # 2. 미등록/실패 종목에 대한 시세 기반 동적 fallback 밴드 (±3%) 확인
+    fallback_bands = slot_b.get_bands("999999", current_price=50000.0)
+    assert fallback_bands["middle"] == 50000.0
+    assert fallback_bands["lower"] == 48500.0  # -3.0%
+    assert fallback_bands["upper"] == 51500.0  # +3.0%
+
+    slot_d = SlotDRetestSwing()
+    assert hasattr(slot_d, "selected_candidates")
+    assert isinstance(slot_d.selected_candidates, list)
+    assert len(slot_d.selected_candidates) > 0
 
 
 

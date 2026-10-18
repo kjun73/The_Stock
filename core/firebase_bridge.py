@@ -38,6 +38,7 @@ class FirebaseBridge:
         self._server_control_listener_registration = None
         self._last_handled_server_control_id = ""
         self.mock_mode = False
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def initialize(self) -> bool:
         """Firebase Admin SDK 초기화"""
@@ -75,8 +76,24 @@ class FirebaseBridge:
             self.mock_mode = True
             return False
 
+    def _get_target_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        """비동기 이벤트 루프 안전 탐색 (메인 루프 우선, 백그라운드 스레드 안전)"""
+        if self._main_loop and not self._main_loop.is_closed():
+            return self._main_loop
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                return asyncio.get_event_loop()
+            except RuntimeError:
+                return None
+
     async def start(self):
         """동기화 루프 및 안드로이드 원격 명령 리스너 시작"""
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         self.initialize()
         self.is_running = True
 
@@ -150,14 +167,14 @@ class FirebaseBridge:
                 if cmd == "STOP" and cmd_id and cmd_id != self._last_handled_server_control_id:
                     self._last_handled_server_control_id = cmd_id
                     logger.info(f"🛑 [FirebaseBridge] 모바일 앱에서 서버 종료 명령 수신 (ID: {cmd_id})")
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = asyncio.get_event_loop()
-                    asyncio.run_coroutine_threadsafe(
-                        self._handle_server_stop_command(cmd_id),
-                        loop
-                    )
+                    loop = self._get_target_loop()
+                    if loop:
+                        asyncio.run_coroutine_threadsafe(
+                            self._handle_server_stop_command(cmd_id),
+                            loop
+                        )
+                    else:
+                        logger.error("❌ [FirebaseBridge] STOP 명령 처리를 위한 비동기 이벤트 루프를 찾을 수 없습니다.")
 
             self._server_control_listener_registration = ref.listen(_on_server_control)
             logger.info("🎧 [FirebaseBridge] /server_control 원격 종료 명령 수신 대기 중")
@@ -196,10 +213,14 @@ class FirebaseBridge:
                     return
 
                 # 비동기 이벤트 루프에 커맨드 실행 위임
-                asyncio.run_coroutine_threadsafe(
-                    self._handle_commands(event.data),
-                    asyncio.get_event_loop()
-                )
+                loop = self._get_target_loop()
+                if loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_commands(event.data),
+                        loop
+                    )
+                else:
+                    logger.error("❌ [FirebaseBridge] 제어 명령 처리를 위한 비동기 이벤트 루프를 찾을 수 없습니다.")
 
             self._listener_registration = ref.listen(_on_command)
             logger.info("🎧 [FirebaseBridge] /commands 원격 제어 명령 수신 대기 중")

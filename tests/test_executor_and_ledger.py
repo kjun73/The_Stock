@@ -1,5 +1,6 @@
 import asyncio
 import os
+import aiosqlite
 import pytest
 from core.executor import SqlPaperExecutor
 from core.ledger import SqliteLedger
@@ -177,4 +178,42 @@ async def test_daily_settlement_persistence(tmp_path):
     # 4. 존재하지 않는 일자 조회 시 None
     non_existent = await ledger.get_daily_settlement("2099-01-01")
     assert non_existent is None
+
+
+@pytest.mark.asyncio
+async def test_half_kelly_capital_allocation(tmp_path):
+    """Half-Kelly 기반 동적 포지션 사이징 계산 및 클램핑 검증"""
+    test_db = str(tmp_path / "test_kelly.db")
+    ledger = SqliteLedger(db_path=test_db)
+    await ledger.init_db()
+
+    # 1. 체결 데이터가 5건 미만일 때: 기본 배정금(250만 원) 반환
+    default_cap = await ledger.compute_half_kelly_capital(slot_id="SLOT_C", default_capital=2_500_000.0)
+    assert default_cap == 2_500_000.0
+
+    # 2. 가상 체결 6건 생성 (4승 2패, 승률 66.7%, 손익비 2.0)
+    # Win trades: +200,000원 x 4건 = 800,000원 (평균익절 200,000)
+    # Loss trades: -100,000원 x 2건 = -200,000원 (평균손실 100,000)
+    # W = 4/6 = 0.667, R = 2.0
+    # Kelly f* = 0.667 - (0.333 / 2.0) = 0.667 - 0.167 = 0.50
+    # Half-Kelly = 0.5 * 0.50 = 0.25 (25%)
+    # 슬롯 C 예수금 10,000,000원 * 25% = 2,500,000원
+    async with ledger._get_connection() if hasattr(ledger, "_get_connection") else aiosqlite.connect(test_db) as db:
+        for i in range(4):
+            await db.execute("""
+                INSERT INTO trade_records 
+                (slot_id, ticker, name, asset_type, quantity, buy_price, sell_price, gross_pnl, total_cost, net_pnl, profit_rate, entry_time, exit_time, exit_reason)
+                VALUES ('SLOT_C', '005930', '삼성전자', 'STOCK', 10, 100000, 120000, 200000, 0, 200000, 2.0, datetime('now'), datetime('now'), 'STRATEGY_TRAILING_STOP')
+            """)
+        for i in range(2):
+            await db.execute("""
+                INSERT INTO trade_records 
+                (slot_id, ticker, name, asset_type, quantity, buy_price, sell_price, gross_pnl, total_cost, net_pnl, profit_rate, entry_time, exit_time, exit_reason)
+                VALUES ('SLOT_C', '005930', '삼성전자', 'STOCK', 10, 100000, 90000, -100000, 0, -100000, -1.0, datetime('now'), datetime('now'), 'STRATEGY_STOP_LOSS')
+            """)
+        await db.commit()
+
+    cap_kelly = await ledger.compute_half_kelly_capital(slot_id="SLOT_C")
+    # 25% 배정 = 2,500,000원
+    assert cap_kelly == 2_500_000.0
 

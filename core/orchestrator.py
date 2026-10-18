@@ -125,9 +125,10 @@ class TradingOrchestrator:
             positions = await self.ledger.get_positions()
             trades = await self.ledger.get_recent_trades(limit=20)
 
+            slot_d = self.strategies.get("SLOT_D")
             screening = {
-                "SLOT_A": getattr(slot_a, "selected_candidates", ["005930", "000660", "005380"]),
-                "SLOT_D": getattr(self.strategies.get("SLOT_D"), "selected_candidates", ["005930", "000660", "035420"])
+                "SLOT_A": getattr(slot_a, "selected_candidates", getattr(slot_a, "universe", ["005930", "000660", "005380"])),
+                "SLOT_D": getattr(slot_d, "selected_candidates", getattr(slot_d, "universe", ["005930", "000660", "035420"]))
             }
             self.latest_screening_candidates = screening
 
@@ -227,6 +228,9 @@ class TradingOrchestrator:
         # 틱 수신 콜백 등록
         self.kis_client.register_tick_callback(self.on_tick_received)
 
+        # 시장 방어 필터 실증 20MA 및 기준지수 동기화
+        self.market_filter.refresh_from_history()
+
         # 지연 기동(08:45 이후) 장전 스크리닝 즉시 캐치업
         await self._check_and_run_morning_catchup()
         # 15:40 이후 또는 주말 기동 시 장후 스크리닝 및 복기 즉시 캐치업
@@ -266,16 +270,7 @@ class TradingOrchestrator:
 
         # KODEX 200 (069500) 틱을 기반으로 실시간 시장 등락률 및 마켓필터 상태 동적 연동
         if tick.ticker == "069500":
-            if not hasattr(self.market_filter, "kodex200_open"):
-                self.market_filter.kodex200_open = tick.price
-            open_p = getattr(self.market_filter, "kodex200_open", tick.price)
-            daily_change = ((tick.price - open_p) / open_p) * 100.0 if open_p > 0 else 0.0
-            current_index = round(2600.0 * (1.0 + daily_change / 100.0), 1)
-            self.market_filter.update_kospi_status(
-                current_index=current_index,
-                ma20=2580.0,
-                daily_change_pct=round(daily_change, 2)
-            )
+            self.market_filter.update_from_kodex200(tick.price)
 
         # 보유 중인 포지션 조회
         positions = await self.ledger.get_positions()
@@ -493,9 +488,10 @@ class TradingOrchestrator:
                     accounts = await self.ledger.get_accounts()
                     positions = await self.ledger.get_positions()
                     trades = await self.ledger.get_recent_trades(limit=20)
+                    slot_d = self.strategies.get("SLOT_D")
                     screening = {
-                        "SLOT_A": getattr(slot_a, "selected_candidates", ["005930", "000660", "005380"]),
-                        "SLOT_D": getattr(self.strategies.get("SLOT_D"), "selected_candidates", ["005930", "000660", "035420"])
+                        "SLOT_A": getattr(slot_a, "selected_candidates", getattr(slot_a, "universe", ["005930", "000660", "005380"])),
+                        "SLOT_D": getattr(slot_d, "selected_candidates", getattr(slot_d, "universe", ["005930", "000660", "035420"]))
                     }
                     self.latest_screening_candidates = screening
                     try:

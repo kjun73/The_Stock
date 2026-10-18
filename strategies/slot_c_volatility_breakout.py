@@ -45,6 +45,13 @@ class SlotCVolatilityBreakout(BaseStrategy):
         self.capital_per_stock: float = 2_500_000.0
         self.bypass_time_filter: bool = False
 
+        # 동적 트레일링 스탑 & 손절선 파라미터 (최근 고변동성 장세 최적화)
+        self.high_watermarks: Dict[str, float] = {}     # 진입 후 종목별 최고가 추적
+        self.trailing_active: Dict[str, bool] = {}       # 트레일링 발동 여부 (+1.5% 도달 시 True)
+        self.trailing_activation_rate: float = 1.5      # +1.5% 도달 시 트레일링 활성화
+        self.trailing_drop_rate: float = 1.0            # 최고가 대비 -1.0% 반락 시 익절
+        self.stop_loss_rate: float = -2.8               # 일중 휩소 노이즈 방어를 위해 -2.8%로 유연화
+
     def update_watchlist(self, top_tickers: List[str], target_prices_map: Dict[str, float]):
         self.universe = top_tickers[:25]
         self.target_prices.update(target_prices_map)
@@ -62,12 +69,14 @@ class SlotCVolatilityBreakout(BaseStrategy):
         if ask_price <= 0 or bid_price <= 0:
             return None
 
-        # 1. 포지션 보유 중인 경우 -> 청산(15:15 타임아웃, 익절, 손절) 검사
+        # 1. 포지션 보유 중인 경우 -> 청산(15:15 타임아웃, 트레일링 익절, 절대 손절) 검사
         if current_position:
             pnl_rate = ((bid_price - current_position.entry_price) / current_position.entry_price) * 100.0
 
-            # (1) 15:15 당일 장마감 전량 청산
-            if current_time >= dtime(15, 15):
+            # (1) 15:15 당일 장마감 전량 청산 (테스트/시뮬레이션 우회 지원)
+            if not self.bypass_time_filter and current_time >= dtime(15, 15):
+                self.high_watermarks.pop(tick.ticker, None)
+                self.trailing_active.pop(tick.ticker, None)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
@@ -80,22 +89,41 @@ class SlotCVolatilityBreakout(BaseStrategy):
                     exit_reason="TIME_EXIT_1515"
                 )
 
-            # (2) 익절 (+3.5%)
-            if pnl_rate >= 3.5:
-                return Signal(
-                    slot_id=self.slot_id,
-                    ticker=tick.ticker,
-                    asset_type="STOCK",
-                    action="SELL",
-                    order_type="MARKET_BREAKOUT",
-                    price=bid_price,
-                    quantity=current_position.quantity,
-                    reason=f"단타 목표 익절 달성 (+{pnl_rate:.2f}%)",
-                    exit_reason="STRATEGY_TAKE_PROFIT"
-                )
+            # 최고가(High-Water Mark) 추적
+            if tick.ticker not in self.high_watermarks:
+                self.high_watermarks[tick.ticker] = max(current_position.entry_price, bid_price)
+            else:
+                if bid_price > self.high_watermarks[tick.ticker]:
+                    self.high_watermarks[tick.ticker] = bid_price
 
-            # (3) 손절 (-2.5%)
-            if pnl_rate <= -2.5:
+            high_price = self.high_watermarks[tick.ticker]
+
+            # 트레일링 모드 활성화 검사 (+1.5% 도달 시)
+            if pnl_rate >= self.trailing_activation_rate:
+                self.trailing_active[tick.ticker] = True
+
+            # (2) 동적 트레일링 익절: 트레일링 활성화 상태에서 최고가 대비 1.0% 이상 반락 시 이익 확정
+            if self.trailing_active.get(tick.ticker, False):
+                drop_from_high = ((high_price - bid_price) / high_price) * 100.0
+                if drop_from_high >= self.trailing_drop_rate:
+                    self.high_watermarks.pop(tick.ticker, None)
+                    self.trailing_active.pop(tick.ticker, None)
+                    return Signal(
+                        slot_id=self.slot_id,
+                        ticker=tick.ticker,
+                        asset_type="STOCK",
+                        action="SELL",
+                        order_type="MARKET_BREAKOUT",
+                        price=bid_price,
+                        quantity=current_position.quantity,
+                        reason=f"트레일링 익절 발동 (최고가 {high_price:,.0f}원 대비 -{drop_from_high:.2f}% 반락, 확정손익률 +{pnl_rate:.2f}%)",
+                        exit_reason="STRATEGY_TRAILING_STOP"
+                    )
+
+            # (3) 하방 절대 손절 (-2.8%)
+            if pnl_rate <= self.stop_loss_rate:
+                self.high_watermarks.pop(tick.ticker, None)
+                self.trailing_active.pop(tick.ticker, None)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
@@ -104,7 +132,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
                     order_type="MARKET_BREAKOUT",
                     price=bid_price,
                     quantity=current_position.quantity,
-                    reason=f"단타 손절선 이탈 ({pnl_rate:.2f}%)",
+                    reason=f"단타 절대 손절선 이탈 ({pnl_rate:.2f}%)",
                     exit_reason="STRATEGY_STOP_LOSS"
                 )
 
@@ -159,8 +187,8 @@ class SlotCVolatilityBreakout(BaseStrategy):
                     price=ask_price,
                     quantity=qty,
                     reason=f"변동성 돌파 및 JEV 승인 ({reason2})",
-                    stop_loss_price=round(ask_price * 0.975, 2),
-                    take_profit_price=round(ask_price * 1.035, 2)
+                    stop_loss_price=round(ask_price * 0.972, 2),
+                    take_profit_price=None
                 )
 
         return None
