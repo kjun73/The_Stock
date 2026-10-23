@@ -34,7 +34,10 @@ class SlotBBollingerGrid(BaseStrategy):
         }
         self.split_stage_tracker: Dict[str, int] = {}  # 종목별 현재 분할 단계 (0, 1, 2, 3)
         self.partial_tp_tracker: Dict[str, bool] = {}  # 종목별 중심선 50% 분할익절 완료 여부
+        self.breakeven_tracker: Dict[str, bool] = {}   # 1차 익절 후 본전 보존 활성화 여부
+        self.partial_tp_rate: float = 2.5              # 지수 ETF +2.5% 도달 시 중심선 미달이어도 1차 익절
         self.bypass_time_filter: bool = False          # 시뮬레이션 및 테스트 시 시간 필터 우회 플래그
+        self._last_band_calc_time: Dict[str, float] = {}  # pykrx 과도 호출 방지 TTL 캐시
 
     def update_bands(self, ticker: str, upper: float, middle: float, lower: float):
         """일봉/분봉 기반 계산된 볼린저 밴드 갱신"""
@@ -63,10 +66,14 @@ class SlotBBollingerGrid(BaseStrategy):
         return None
 
     def get_bands(self, ticker: str, current_price: Optional[float] = None) -> Dict[str, float]:
-        """볼린저 밴드 조회 (없거나 괴리율이 클 경우 pykrx 실증 계산 또는 동적 적응)"""
+        """볼린저 밴드 조회 (없거나 괴리율이 클 경우 5분 TTL 내 pykrx 실증 계산 또는 동적 적응)"""
         band = self.bands.get(ticker)
+        now_ts = datetime.now().timestamp()
+        last_calc = self._last_band_calc_time.get(ticker, 0.0)
+
         if current_price and current_price > 0:
-            if not band or abs(band["middle"] - current_price) / current_price > 0.10:
+            if not band or (abs(band["middle"] - current_price) / current_price > 0.10 and (now_ts - last_calc) > 300.0):
+                self._last_band_calc_time[ticker] = now_ts
                 band = self.calculate_bollinger_bands_from_history(ticker)
                 if not band:
                     mid = current_price
@@ -109,26 +116,54 @@ class SlotBBollingerGrid(BaseStrategy):
         if current_position:
             pnl_rate = ((bid_price - current_position.entry_price) / current_position.entry_price) * 100.0
 
-            # (1) 손절 (-3.5%)
-            if pnl_rate <= -3.5:
-                self.split_stage_tracker[tick.ticker] = 0
-                self.partial_tp_tracker[tick.ticker] = False
-                return Signal(
-                    slot_id=self.slot_id,
-                    ticker=tick.ticker,
-                    asset_type="ETF",
-                    action="SELL",
-                    order_type="LIMIT_NORMAL",
-                    price=bid_price,
-                    quantity=current_position.quantity,
-                    reason=f"볼린저 하방 이탈 손절 ({pnl_rate:.2f}%)",
-                    exit_reason="STRATEGY_STOP_LOSS"
-                )
+            has_done_partial_tp = (
+                self.partial_tp_tracker.get(tick.ticker, False)
+                or (current_position.stop_loss_price >= current_position.entry_price)
+            )
+            is_breakeven_active = (
+                self.breakeven_tracker.get(tick.ticker, False)
+                or (current_position.stop_loss_price >= current_position.entry_price)
+            )
 
-            # (2) 상단선(+2σ) 전량 익절
-            if bid_price >= upper:
+            # (1) 손절: 1차 익절 완료 시 본전(+0.15%) 보존 손절, 미완료 시 초기 손절(-3.5%)
+            if is_breakeven_active:
+                if pnl_rate <= 0.15:
+                    self.split_stage_tracker[tick.ticker] = 0
+                    self.partial_tp_tracker.pop(tick.ticker, None)
+                    self.breakeven_tracker.pop(tick.ticker, None)
+                    return Signal(
+                        slot_id=self.slot_id,
+                        ticker=tick.ticker,
+                        asset_type="ETF",
+                        action="SELL",
+                        order_type="LIMIT_NORMAL",
+                        price=bid_price,
+                        quantity=current_position.quantity,
+                        reason=f"볼린저 1차 익절 후 본전(+0.15%) 보존 손절 ({pnl_rate:.2f}%)",
+                        exit_reason="STRATEGY_BREAKEVEN_STOP"
+                    )
+            else:
+                if pnl_rate <= -3.5:
+                    self.split_stage_tracker[tick.ticker] = 0
+                    self.partial_tp_tracker.pop(tick.ticker, None)
+                    self.breakeven_tracker.pop(tick.ticker, None)
+                    return Signal(
+                        slot_id=self.slot_id,
+                        ticker=tick.ticker,
+                        asset_type="ETF",
+                        action="SELL",
+                        order_type="LIMIT_NORMAL",
+                        price=bid_price,
+                        quantity=current_position.quantity,
+                        reason=f"볼린저 하방 이탈 손절 ({pnl_rate:.2f}%)",
+                        exit_reason="STRATEGY_STOP_LOSS"
+                    )
+
+            # (2) 상단선(+2σ) 또는 +5.0% 이상 전량 익절
+            if bid_price >= upper or pnl_rate >= 5.0:
                 self.split_stage_tracker[tick.ticker] = 0
-                self.partial_tp_tracker[tick.ticker] = False
+                self.partial_tp_tracker.pop(tick.ticker, None)
+                self.breakeven_tracker.pop(tick.ticker, None)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
@@ -141,11 +176,13 @@ class SlotBBollingerGrid(BaseStrategy):
                     exit_reason="STRATEGY_TAKE_PROFIT"
                 )
 
-            # (3) 중심선(20MA) 50% 분할 익절 (1회 한정)
-            if bid_price >= middle and current_position.quantity >= 2 and not self.partial_tp_tracker.get(tick.ticker, False):
+            # (3) 중심선(20MA) 또는 목표수익률(+2.5%) 도달 시 50% 1차 분할 익절 & 본전 손절선 상향 (1회 한정)
+            if (bid_price >= middle or pnl_rate >= self.partial_tp_rate) and current_position.quantity >= 2 and not has_done_partial_tp:
                 half_qty = current_position.quantity // 2
                 if half_qty > 0:
                     self.partial_tp_tracker[tick.ticker] = True
+                    self.breakeven_tracker[tick.ticker] = True
+                    new_sl = round(current_position.entry_price * 1.0015, 2)
                     return Signal(
                         slot_id=self.slot_id,
                         ticker=tick.ticker,
@@ -155,7 +192,8 @@ class SlotBBollingerGrid(BaseStrategy):
                         price=bid_price,
                         quantity=half_qty,
                         reason=f"볼린저 중심선 도달 50% 분할 익절 (+{pnl_rate:.2f}%)",
-                        exit_reason="STRATEGY_TAKE_PROFIT"
+                        stop_loss_price=new_sl,
+                        exit_reason="STRATEGY_PARTIAL_TP"
                     )
 
             # (4) 2차 / 3차 추가 분할 매수 검사
@@ -198,9 +236,10 @@ class SlotBBollingerGrid(BaseStrategy):
             return None
 
         # 2. 미보유 상태 -> 하단선(-2σ) 터치 시 1차 30% 분할 매수
-        self.split_stage_tracker[tick.ticker] = 0
-        self.partial_tp_tracker[tick.ticker] = False
-        if ask_price <= lower:
+        if self.split_stage_tracker.get(tick.ticker, 0) >= 1:
+            return None  # 이미 당일 1차 매수 주문이 제출되어 체결 대기 중이면 중복 매수 차단
+
+        if lower > 0 and ask_price <= lower:
             qty = int(1_500_000 // ask_price)  # 30% (150만 원)
             if qty > 0:
                 self.split_stage_tracker[tick.ticker] = 1
@@ -217,4 +256,10 @@ class SlotBBollingerGrid(BaseStrategy):
                 )
 
         return None
+
+    def reset_daily_state(self):
+        """매일 장 시작 전(08:45) 일일 상태 초기화"""
+        self.split_stage_tracker.clear()
+        self.partial_tp_tracker.clear()
+        self.breakeven_tracker.clear()
 

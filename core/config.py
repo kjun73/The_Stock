@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     SERVER_AUTH_TOKEN: str = "dev-secret-token"
     DB_PATH: str = "the_stock.db"
 
+    # KRX Data Portal (data.krx.co.kr) Login Credentials for pykrx
+    KRX_ID: Optional[str] = None
+    KRX_PW: Optional[str] = None
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -56,3 +60,26 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def init_krx_environment():
+    """
+    .env에 설정된 KRX_ID, KRX_PW를 os.environ에 주입하고
+    pykrx가 이미 로드된 경우 KRX 인증 세션을 즉시 갱신합니다.
+    """
+    import os
+    import sys
+    if settings.KRX_ID and settings.KRX_PW and not settings.KRX_ID.startswith("your_"):
+        os.environ["KRX_ID"] = settings.KRX_ID
+        os.environ["KRX_PW"] = settings.KRX_PW
+        if "pykrx.website.comm.auth" in sys.modules:
+            try:
+                from pykrx.website.comm.auth import build_krx_session, set_auth_session
+                krx_sess = build_krx_session(settings.KRX_ID, settings.KRX_PW)
+                if krx_sess:
+                    set_auth_session(krx_sess)
+            except Exception:
+                pass
+
+
+init_krx_environment()

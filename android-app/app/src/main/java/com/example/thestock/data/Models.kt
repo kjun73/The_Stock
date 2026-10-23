@@ -19,8 +19,26 @@ data class PortfolioSummary(
 data class MarketFilterStatus(
     val kospi_index: Double = 2600.0,
     val kospi_20ma: Double = 2580.0,
+    val kospi_daily_change_pct: Double = 0.0,
     val is_bear_market: Boolean = false,
-    val is_panic_sell_day: Boolean = false
+    val is_panic_sell_day: Boolean = false,
+    val is_strong_rebound_day: Boolean = false,
+    val is_super_rally_day: Boolean = false
+)
+
+@Serializable
+data class DailySettlementDto(
+    val date: String = "",
+    val total_asset: Double = 40_000_000.0,
+    val cash_balance: Double = 40_000_000.0,
+    val stock_value: Double = 0.0,
+    val total_profit: Double = 0.0,
+    val profit_rate: Double = 0.0,
+    val realized_pnl: Double = 0.0,
+    val unrealized_pnl: Double = 0.0,
+    val trade_count: Int = 0,
+    val review_markdown: String = "",
+    val screening_json: String = "{}"
 )
 
 @Serializable
@@ -91,7 +109,8 @@ data class SystemStatusDto(
     val market_filter: MarketFilterStatus = MarketFilterStatus(),
     val slots: Map<String, SlotAccountDto> = emptyMap(),
     val recent_trades: List<TradeRecordDto> = emptyList(),
-    val intelligence: IntelligenceDto = IntelligenceDto()
+    val intelligence: IntelligenceDto = IntelligenceDto(),
+    val settlement_history: List<DailySettlementDto> = emptyList()
 )
 
 @Serializable

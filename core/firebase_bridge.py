@@ -285,7 +285,8 @@ class FirebaseBridge:
                 if self.is_connected and not self.mock_mode:
                     accounts = await self.orchestrator.ledger.get_accounts()
                     positions = await self.orchestrator.ledger.get_positions()
-                    recent_trades = await self.orchestrator.ledger.get_recent_trades(limit=10)
+                    recent_trades = await self.orchestrator.ledger.get_recent_trades(limit=50)
+                    settlements = await self.orchestrator.ledger.get_daily_settlements(limit=14)
 
                     # 포트폴리오 종합 계산
                     total_asset = sum(a.total_asset for a in accounts)
@@ -313,8 +314,11 @@ class FirebaseBridge:
                         "market_filter": {
                             "kospi_index": self.orchestrator.market_filter.kospi_index,
                             "kospi_20ma": self.orchestrator.market_filter.kospi_20ma,
+                            "kospi_daily_change_pct": self.orchestrator.market_filter.kospi_daily_change_pct,
                             "is_bear_market": self.orchestrator.market_filter.is_bear_market,
                             "is_panic_sell_day": self.orchestrator.market_filter.is_panic_sell_day,
+                            "is_strong_rebound_day": self.orchestrator.market_filter.is_strong_rebound_day,
+                            "is_super_rally_day": self.orchestrator.market_filter.is_super_rally_day,
                         },
                         "slots": {
                             acc.slot_id: {
@@ -327,6 +331,9 @@ class FirebaseBridge:
                         },
                         "recent_trades": [
                             t.model_dump(mode='json') for t in recent_trades
+                        ],
+                        "settlement_history": [
+                            s.model_dump(mode='json') for s in settlements
                         ],
                         "intelligence": {
                             "daily_review": getattr(self.orchestrator, "latest_daily_review", ""),
@@ -351,10 +358,10 @@ class FirebaseBridge:
 
     def sync_app_version(
         self,
-        version_code: int = 6,
-        version_name: str = "1.0.5",
-        apk_url: str = "https://github.com/kjun73/The_Stock/releases/download/v1.0.5/app-debug.apk",
-        notes: str = "개장일 자동 기동/종료 엔진 및 모바일 원격 제어 보안 개편",
+        version_code: int = 7,
+        version_name: str = "1.0.9",
+        apk_url: str = "https://github.com/kjun73/The_Stock/releases/download/v1.0.9/app-debug.apk",
+        notes: str = "v1.0.9 KRX 공식 연동, 14일 자산 곡선(Equity Curve), 본전/트레일링 배지, 청산 손익비 요약 및 날짜별 복기 뷰어 탑재",
         is_force: bool = False
     ):
         """안드로이드 인앱 자동 업데이트 메타데이터 동기화"""

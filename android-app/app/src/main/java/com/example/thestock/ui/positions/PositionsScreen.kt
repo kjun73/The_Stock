@@ -295,6 +295,38 @@ fun PositionsScreen(
                                                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                                             )
                                         }
+
+                                        val isBreakevenLocked = pos.stop_loss_price >= pos.entry_price
+                                        val isTrailingActive = (pos.slot_id == "SLOT_C" && pos.profit_rate >= 1.5) || (pos.slot_id == "SLOT_D" && pos.profit_rate >= 3.5)
+                                        if (isBreakevenLocked) {
+                                            Spacer(Modifier.width(4.dp))
+                                            Surface(
+                                                shape = RoundedCornerShape(3.dp),
+                                                color = Color(0x2600E676)
+                                            ) {
+                                                Text(
+                                                    text = "🛡️ 본전잠금",
+                                                    color = NeonGreen,
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                                )
+                                            }
+                                        } else if (isTrailingActive) {
+                                            Spacer(Modifier.width(4.dp))
+                                            Surface(
+                                                shape = RoundedCornerShape(3.dp),
+                                                color = Color(0x26FFD600)
+                                            ) {
+                                                Text(
+                                                    text = "🔥 트레일링",
+                                                    color = ElectricYellow,
+                                                    fontSize = 9.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                                )
+                                            }
+                                        }
                                     }
 
                                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -448,6 +480,46 @@ fun PositionsScreen(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    item {
+                        val totalNetPnl = slotTrades.sumOf { it.net_pnl }
+                        val winTrades = slotTrades.filter { it.net_pnl > 0 }
+                        val lossTrades = slotTrades.filter { it.net_pnl < 0 }
+                        val winRate = if (slotTrades.isNotEmpty()) (winTrades.size.toDouble() / slotTrades.size * 100.0) else 0.0
+                        val avgGain = if (winTrades.isNotEmpty()) (winTrades.sumOf { it.net_pnl } / winTrades.size) else 0.0
+                        val avgLoss = if (lossTrades.isNotEmpty()) (lossTrades.sumOf { Math.abs(it.net_pnl) } / lossTrades.size) else 0.0
+                        val payoff = if (avgLoss > 0) String.format(Locale.US, "%.1f", avgGain / avgLoss) else if (avgGain > 0) "∞" else "0.0"
+                        val isNetProfitable = totalNetPnl >= 0
+
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = SurfaceVariantDark),
+                            shape = RoundedCornerShape(6.dp),
+                            border = BorderStroke(1.dp, SurfaceBorder)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "실현손익: ${if (isNetProfitable) "+" else ""}${wonFormat.format(totalNetPnl.toLong())}원",
+                                    color = if (isNetProfitable) NeonGreen else NeonRed,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(
+                                    text = "승률 ${String.format(Locale.US, "%.0f", winRate)}% (${winTrades.size}승 ${lossTrades.size}패) · 손익비 ${payoff}",
+                                    color = TextSecondary,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    }
+
                     items(slotTrades) { trade ->
                         val isProfit = trade.net_pnl >= 0
                         Card(

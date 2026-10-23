@@ -217,3 +217,103 @@ async def test_half_kelly_capital_allocation(tmp_path):
     # 25% 배정 = 2,500,000원
     assert cap_kelly == 2_500_000.0
 
+    # 3. 연패 구간 (1승 5패, 기대값 음수): 최소 방어 금액(1,000,000원) 반환 검증
+    async with aiosqlite.connect(test_db) as db:
+        await db.execute("DELETE FROM trade_records WHERE slot_id = 'SLOT_C'")
+        # 1승 (+50,000) 5패 (-100,000 x 5)
+        await db.execute("""
+            INSERT INTO trade_records 
+            (slot_id, ticker, name, asset_type, quantity, buy_price, sell_price, gross_pnl, total_cost, net_pnl, profit_rate, entry_time, exit_time, exit_reason)
+            VALUES ('SLOT_C', '005930', '삼성전자', 'STOCK', 10, 100000, 105000, 50000, 0, 50000, 0.5, datetime('now'), datetime('now'), 'STRATEGY_TRAILING_STOP')
+        """)
+        for _ in range(5):
+            await db.execute("""
+                INSERT INTO trade_records 
+                (slot_id, ticker, name, asset_type, quantity, buy_price, sell_price, gross_pnl, total_cost, net_pnl, profit_rate, entry_time, exit_time, exit_reason)
+                VALUES ('SLOT_C', '005930', '삼성전자', 'STOCK', 10, 100000, 90000, -100000, 0, -100000, -1.0, datetime('now'), datetime('now'), 'STRATEGY_STOP_LOSS')
+            """)
+        await db.commit()
+
+    cap_negative = await ledger.compute_half_kelly_capital(slot_id="SLOT_C")
+    assert cap_negative == 1_000_000.0, f"연패 구간에서는 최소 방어금액(1,000,000)이어야 함: {cap_negative}"
+
+
+@pytest.mark.asyncio
+async def test_split_buy_avg_price_and_stop_loss_update(tmp_path):
+    """분할 매수 시 평단가 및 손절가 비례 재계산 검증"""
+    test_db = str(tmp_path / "test_split.db")
+    ledger = SqliteLedger(db_path=test_db)
+    await ledger.init_db()
+
+    tick1 = TickData(ticker="005930", price=100_000.0, volume=1000, ask_price=100_000.0, bid_price=99_900.0)
+    sig1 = Signal(
+        slot_id="SLOT_A",
+        ticker="005930",
+        asset_type="STOCK",
+        action="BUY",
+        order_type="LIMIT_NORMAL",
+        price=100_000.0,
+        quantity=10,
+        reason="1차 분할 매수",
+        stop_loss_price=96_500.0,   # -3.5%
+        take_profit_price=103_000.0 # +3.0%
+    )
+    pos1 = await ledger.open_position(sig1, tick1)
+    assert pos1.quantity == 10
+    assert pos1.entry_price == 100_000.0
+    assert pos1.stop_loss_price == 96_500.0
+
+    # 2차 분할 매수: 110,000원에 10주 추가 매수
+    tick2 = TickData(ticker="005930", price=110_000.0, volume=1000, ask_price=110_000.0, bid_price=109_900.0)
+    sig2 = Signal(
+        slot_id="SLOT_A",
+        ticker="005930",
+        asset_type="STOCK",
+        action="BUY",
+        order_type="SPLIT_BUY_2",
+        price=110_000.0,
+        quantity=10,
+        reason="2차 분할 매수",
+        stop_loss_price=round(110_000.0 * 0.965, 2),  # 2차 매수가 기준 -3.5%
+        take_profit_price=round(110_000.0 * 1.06, 2)
+    )
+    pos2 = await ledger.open_position(sig2, tick2)
+    assert pos2.quantity == 20
+    # 새 평단가: (100,000 * 10 + 110,000 * 10) / 20 = 105,000원
+    assert pos2.entry_price == 105_000.0
+    # 손절가도 새 평단가 105,000원의 -3.5%인 101,325원으로 자동 비례 갱신되어야 함
+    assert pos2.stop_loss_price == round(105_000.0 * 0.965, 2)
+    await ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_ledger_holding_days_calculation(tmp_path):
+    """과거 일자(5일 전, 최소 3영업일 이상)로 저장된 포지션 조회 시 holding_days가 >= 3으로 자동 계산되는지 검증"""
+    test_db = str(tmp_path / "test_holding.db")
+    ledger = SqliteLedger(db_path=test_db)
+    await ledger.init_db()
+
+    from datetime import datetime, timedelta
+    past_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d 09:30:00")
+
+    async with aiosqlite.connect(test_db) as db:
+        await db.execute("""
+            INSERT INTO slot_positions 
+            (slot_id, ticker, name, asset_type, quantity, entry_price, current_price, stop_loss_price, take_profit_price, profit_rate, entry_time, holding_days)
+            VALUES ('SLOT_A', '005930', '삼성전자', 'STOCK', 10, 100000, 100000, 96500, 106000, 0.0, ?, 0)
+        """, (past_date,))
+        await db.commit()
+
+    positions = await ledger.get_positions("SLOT_A")
+    assert len(positions) == 1
+    assert positions[0].holding_days >= 3, f"5일 전 진입 포지션의 영업일 경과일수는 최소 3일 이상이어야 함: {positions[0].holding_days}"
+
+    await ledger.refresh_holding_days()
+    async with aiosqlite.connect(test_db) as db:
+        cur = await db.execute("SELECT holding_days FROM slot_positions WHERE slot_id = 'SLOT_A'")
+        db_days = (await cur.fetchone())[0]
+        assert db_days >= 3
+    await ledger.close()
+
+
+

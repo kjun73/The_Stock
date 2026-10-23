@@ -53,14 +53,32 @@ class TradingOrchestrator:
         self._last_evening_screen_date: Optional[str] = None
         self._last_exit_1515_date: Optional[str] = None
 
+        # 주문 중복 방어 락 및 포지션 메모리 캐시
+        self._pending_orders: set = set()
+        self._positions_cache: List[SlotPosition] = []
+        self._positions_cache_dirty: bool = True
+
         self.latest_daily_review: str = ""
         self.latest_morning_briefing: str = ""
         self.latest_weekly_review: str = ""
         self.latest_screening_candidates: Dict[str, List[str]] = {
             "SLOT_A": ["005930", "000660", "005380"],
-            "SLOT_D": ["005930", "000660", "035420"]
+            "SLOT_D": ["035420", "068270", "012450"]
         }
         self._load_cached_reports()
+
+    async def get_cached_positions(self, slot_id: Optional[str] = None) -> List[SlotPosition]:
+        """포지션 메모리 캐시 조회 (DB 풀쿼리 방지)"""
+        if self._positions_cache_dirty:
+            self._positions_cache = await self.ledger.get_positions()
+            self._positions_cache_dirty = False
+        if slot_id:
+            return [p for p in self._positions_cache if p.slot_id == slot_id]
+        return self._positions_cache
+
+    def invalidate_positions_cache(self):
+        """포지션 변동 시 캐시 무효화"""
+        self._positions_cache_dirty = True
 
     def _load_cached_reports(self):
         """기존 디스크에 저장된 복기 및 브리핑 리포트 메모리 캐시 로드"""
@@ -91,11 +109,24 @@ class TradingOrchestrator:
 
         if current_time >= dtime(8, 45) and current_time < dtime(15, 30):
             if self._last_morning_screen_date != today_str:
-                logger.info("☀️ [Orchestrator] 08:45 이후(정규장 중) 기동 감지 -> 슬롯 D 장전 스크리닝 및 브리핑 즉시 캐치업 실행")
+                logger.info("☀️ [Orchestrator] 08:45 이후(정규장 중) 기동 감지 -> 장전 리셋, 캘리브레이션 및 슬롯 D 스크리닝 즉시 실행")
+                await self.ledger.refresh_holding_days()
+                for strat in self.strategies.values():
+                    if hasattr(strat, "reset_daily_state"):
+                        strat.reset_daily_state()
+
+                slot_c = self.strategies.get("SLOT_C")
+                if isinstance(slot_c, SlotCVolatilityBreakout):
+                    await slot_c.run_morning_calibration()
+
+                slot_a = self.strategies.get("SLOT_A")
+                slot_a_cands = getattr(slot_a, "selected_candidates", []) if slot_a else []
                 slot_d = self.strategies.get("SLOT_D")
                 if isinstance(slot_d, SlotDRetestSwing):
-                    await slot_d.run_morning_screening()
+                    await slot_d.run_morning_screening(exclude_tickers=slot_a_cands)
                     self.sync_all_subscriptions()
+
+                await self.sync_half_kelly_capitals()
 
                 try:
                     await self.gemini_analyst.generate_morning_briefing({
@@ -220,6 +251,32 @@ class TradingOrchestrator:
         subscribed = quota_mgr.get_subscribed_tickers() if hasattr(quota_mgr, "get_subscribed_tickers") else []
         logger.info(f"📡 [Orchestrator] 전 슬롯 시세 구독 동기화 완료: 총 {len(subscribed)}개 종목 관제 중 ({subscribed})")
 
+    async def sync_half_kelly_capitals(self):
+        """최근 체결 승률/손익비 기반 Half-Kelly 동적 자금 계산 후 4개 전략에 주입"""
+        try:
+            slot_a = self.strategies.get("SLOT_A")
+            if slot_a and hasattr(slot_a, "target_capital_per_stock"):
+                cap_a = await self.ledger.compute_half_kelly_capital("SLOT_A", default_capital=3_300_000.0)
+                slot_a.target_capital_per_stock = cap_a
+
+            slot_b = self.strategies.get("SLOT_B")
+            if slot_b and hasattr(slot_b, "allocated_capital_per_stock"):
+                cap_b = await self.ledger.compute_half_kelly_capital("SLOT_B", default_capital=5_000_000.0)
+                slot_b.allocated_capital_per_stock = cap_b
+
+            slot_c = self.strategies.get("SLOT_C")
+            if slot_c and hasattr(slot_c, "capital_per_stock"):
+                cap_c = await self.ledger.compute_half_kelly_capital("SLOT_C", default_capital=2_500_000.0)
+                slot_c.capital_per_stock = cap_c
+
+            slot_d = self.strategies.get("SLOT_D")
+            if slot_d and hasattr(slot_d, "capital_per_stock"):
+                cap_d = await self.ledger.compute_half_kelly_capital("SLOT_D", default_capital=3_300_000.0)
+                slot_d.capital_per_stock = cap_d
+            logger.info("⚖️ [Orchestrator] 4대 슬롯 Half-Kelly 동적 포지션 사이징 동기화 완료")
+        except Exception as e:
+            logger.warning(f"Half-Kelly 동기화 예외: {e}")
+
     async def start(self):
         """오케스트레이터 시작 (DB 초기화, 틱 콜백 등록, 스케줄러 태스크 시작)"""
         logger.info("🚀 [Orchestrator] 주식 자동매매 오케스트레이터 시작")
@@ -243,6 +300,9 @@ class TradingOrchestrator:
 
         # 전 슬롯 유니버스 종목 브로커 시세 구독 매니저에 일괄 등록
         self.sync_all_subscriptions()
+
+        # 최근 체결 기반 Half-Kelly 동적 자금 배정 동기화
+        await self.sync_half_kelly_capitals()
 
         self.is_running = True
         self._main_task = asyncio.create_task(self._run_loop())
@@ -272,8 +332,8 @@ class TradingOrchestrator:
         if tick.ticker == "069500":
             self.market_filter.update_from_kodex200(tick.price)
 
-        # 보유 중인 포지션 조회
-        positions = await self.ledger.get_positions()
+        # 보유 중인 포지션 조회 (캐시 활용으로 매 틱 DB 풀쿼리 제거)
+        positions = await self.get_cached_positions()
         positions_by_slot = {f"{p.slot_id}:{p.ticker}": p for p in positions}
 
         # 관련 슬롯 전략 순회 및 평가
@@ -292,53 +352,96 @@ class TradingOrchestrator:
 
     async def _process_signal(self, signal: Signal, tick: TickData):
         """시그널 발생 시 마켓 필터 및 자금 검증 후 체결 엔진 집행"""
-        if signal.action == "SELL":
-            # 매도/청산은 마켓필터와 무관하게 즉시 집행 (손절/익절/시간청산)
-            exit_reason = signal.exit_reason or "STRATEGY_TAKE_PROFIT"
-            trade = await self.ledger.close_position(
-                slot_id=signal.slot_id,
-                ticker=signal.ticker,
-                tick=tick,
-                exit_reason=exit_reason,
-                order_type=signal.order_type,
-                quantity=signal.quantity
-            )
-            if trade:
-                logger.info(
-                    f"🎯 [체결 완료] {signal.slot_id} {signal.ticker} 청산: "
-                    f"수익률 {trade.profit_rate:+.2f}%, 순손익 {trade.net_pnl:+,.0f}원, 사유={exit_reason}"
-                )
-                # 보유종목 목록 갱신
-                remaining_positions = await self.ledger.get_positions()
-                self.kis_client.quota_manager.update_held_positions(
-                    list({p.ticker for p in remaining_positions})
-                )
+        pending_key = f"{signal.slot_id}:{signal.ticker}"
+        if pending_key in self._pending_orders:
+            logger.debug(f"⏳ [주문 대기 중] {pending_key} 이미 주문 집행 중이므로 중복 시그널 무시")
+            return
 
-        elif signal.action == "BUY":
-            # 신규 진입 시 마켓필터 통과 여부 확인
-            if not self.market_filter.can_enter(signal.slot_id):
-                logger.info(f"🚫 [진입 차단] 마켓필터 하락장 방어막에 의해 {signal.slot_id} {signal.ticker} 매수 보류")
-                return
+        self._pending_orders.add(pending_key)
+        try:
+            if signal.action == "SELL":
+                # 매도/청산은 마켓필터와 무관하게 즉시 집행 (손절/익절/시간청산)
+                exit_reason = signal.exit_reason or "STRATEGY_TAKE_PROFIT"
+                trade = await self.ledger.close_position(
+                    slot_id=signal.slot_id,
+                    ticker=signal.ticker,
+                    tick=tick,
+                    exit_reason=exit_reason,
+                    order_type=signal.order_type,
+                    quantity=signal.quantity
+                )
+                if trade:
+                    logger.info(
+                        f"🎯 [체결 완료] {signal.slot_id} {signal.ticker} 청산: "
+                        f"수익률 {trade.profit_rate:+.2f}%, 순손익 {trade.net_pnl:+,.0f}원, 사유={exit_reason}"
+                    )
+                    # 1차 분할 익절(STRATEGY_PARTIAL_TP) 시 잔여 수량에 대해 DB stop_loss_price를 실질 본전(+0.3%)으로 즉시 영구 상향
+                    if signal.exit_reason == "STRATEGY_PARTIAL_TP" and signal.stop_loss_price:
+                        await self.ledger.update_stop_loss_price(signal.slot_id, signal.ticker, signal.stop_loss_price)
+                        logger.info(f"🛡️ [Orchestrator] {signal.slot_id} {signal.ticker} DB 손절가를 본전({signal.stop_loss_price:,.0f}원)으로 영구 상향 완료")
 
-            # 보유 종목 수 상한 확인 (슬롯 A: 최대 3종목 등)
-            positions = await self.ledger.get_positions(signal.slot_id)
-            if signal.slot_id == "SLOT_A" and len(positions) >= 3:
-                # 추가 분할 매수가 아닌 신규 종목 진입인 경우 차단
-                if not any(p.ticker == signal.ticker for p in positions):
-                    logger.info("🚫 [SLOT_A] 최대 보유 종목 수(3종목) 도달로 신규 진입 차단")
+                    self.invalidate_positions_cache()
+                    # 보유종목 목록 갱신
+                    remaining_positions = await self.get_cached_positions()
+                    self.kis_client.quota_manager.update_held_positions(
+                        list({p.ticker for p in remaining_positions})
+                    )
+                    # 청산 후 승률/손익비 변동을 반영하여 Half-Kelly 동기화
+                    await self.sync_half_kelly_capitals()
+
+            elif signal.action == "BUY":
+                # 1. 신규 진입 시 마켓필터 통과 여부 확인
+                if not self.market_filter.can_enter(signal.slot_id):
+                    logger.info(f"🚫 [진입 차단] 마켓필터 하락장 방어막에 의해 {signal.slot_id} {signal.ticker} 매수 보류")
                     return
 
-            new_pos = await self.ledger.open_position(signal, tick)
-            if new_pos:
-                logger.info(
-                    f"🛒 [매수 체결] {signal.slot_id} {signal.ticker} {signal.quantity}주 @ {new_pos.entry_price:,.0f}원 "
-                    f"({signal.order_type})"
-                )
-                # 보유종목 웹소켓 쿼터 우선 승격
-                all_positions = await self.ledger.get_positions()
-                self.kis_client.quota_manager.update_held_positions(
-                    list({p.ticker for p in all_positions})
-                )
+                # 2. 전체 계좌 기준 특정 종목 노출도 가드 (최대 35% 자금 상한선 적용)
+                all_positions = await self.get_cached_positions()
+                accounts = await self.ledger.get_accounts()
+                total_account_asset = sum(acc.total_asset for acc in accounts)
+                if total_account_asset > 0:
+                    current_stock_value = sum(
+                        (p.current_price or p.entry_price) * p.quantity
+                        for p in all_positions if p.ticker == signal.ticker
+                    )
+                    new_order_value = signal.price * signal.quantity
+                    projected_ratio = (current_stock_value + new_order_value) / total_account_asset
+                    if projected_ratio > 0.35:
+                        logger.warning(
+                            f"🚫 [노출도 제한 차단] {signal.ticker} 매수 시 전체 자산 대비 비중 {projected_ratio*100:.1f}%로 "
+                            f"단일 종목 최대 한도(35%) 초과 -> 신규 매수 기각"
+                        )
+                        return
+
+                # 3. 슬롯별 보유 종목 수 상한 확인 (슬롯 A: 최대 3종목, 슬롯 C: 최대 4종목 등)
+                slot_positions = [p for p in all_positions if p.slot_id == signal.slot_id]
+                if signal.slot_id == "SLOT_A" and len(slot_positions) >= 3:
+                    if not any(p.ticker == signal.ticker for p in slot_positions):
+                        logger.info("🚫 [SLOT_A] 최대 보유 종목 수(3종목) 도달로 신규 진입 차단")
+                        return
+                elif signal.slot_id == "SLOT_C" and len(slot_positions) >= 4:
+                    if not any(p.ticker == signal.ticker for p in slot_positions):
+                        logger.info("🚫 [SLOT_C] 최대 보유 종목 수(4종목) 도달로 신규 진입 차단")
+                        return
+                elif signal.slot_id == "SLOT_D" and len(slot_positions) >= 3:
+                    if not any(p.ticker == signal.ticker for p in slot_positions):
+                        logger.info("🚫 [SLOT_D] 최대 보유 종목 수(3종목) 도달로 신규 진입 차단")
+                        return
+
+                new_pos = await self.ledger.open_position(signal, tick)
+                if new_pos:
+                    logger.info(
+                        f"🛒 [매수 체결] {signal.slot_id} {signal.ticker} {signal.quantity}주 @ {new_pos.entry_price:,.0f}원 "
+                        f"({signal.order_type})"
+                    )
+                    self.invalidate_positions_cache()
+                    # 보유종목 웹소켓 쿼터 우선 승격
+                    all_positions_updated = await self.get_cached_positions()
+                    self.kis_client.quota_manager.update_held_positions(
+                        list({p.ticker for p in all_positions_updated})
+                    )
+        finally:
+            self._pending_orders.discard(pending_key)
 
     async def execute_emergency_flush(self):
         """
@@ -438,13 +541,26 @@ class TradingOrchestrator:
                 today_str = now.strftime("%Y-%m-%d")
                 current_time = now.time()
 
-                # 1. 08:45 이후 슬롯 D 전고점 돌파 스크리닝 및 Gemini 브리핑
+                # 1. 08:45 이후 장전 리셋, 캘리브레이션, 슬롯 D 스크리닝 및 Gemini 브리핑
                 if current_time >= dtime(8, 45) and current_time < dtime(15, 30) and self._last_morning_screen_date != today_str:
-                    logger.info("⏰ [08:45] 슬롯 D 전고점 돌파 첫 눌림목 장전 스크리닝 및 브리핑 실행")
+                    logger.info("⏰ [08:45] 장전 루틴 가동: holding_days 갱신, 전략 리셋, 캘리브레이션 및 슬롯 D 스크리닝")
+                    await self.ledger.refresh_holding_days()
+                    for strat in self.strategies.values():
+                        if hasattr(strat, "reset_daily_state"):
+                            strat.reset_daily_state()
+
+                    slot_c = self.strategies.get("SLOT_C")
+                    if isinstance(slot_c, SlotCVolatilityBreakout):
+                        await slot_c.run_morning_calibration()
+
+                    slot_a = self.strategies.get("SLOT_A")
+                    slot_a_cands = getattr(slot_a, "selected_candidates", []) if slot_a else []
                     slot_d = self.strategies.get("SLOT_D")
                     if isinstance(slot_d, SlotDRetestSwing):
-                        await slot_d.run_morning_screening()
+                        await slot_d.run_morning_screening(exclude_tickers=slot_a_cands)
                         self.sync_all_subscriptions()
+
+                    await self.sync_half_kelly_capitals()
 
                     try:
                         await self.gemini_analyst.generate_morning_briefing({

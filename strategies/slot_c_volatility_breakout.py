@@ -9,7 +9,11 @@ from strategies.base import BaseStrategy
 logger = logging.getLogger(__name__)
 
 
+ETF_UNIVERSE_SET = {"069500", "229200", "122630", "233740", "114800", "252670"}
+
 DEFAULT_MOMENTUM_UNIVERSE = [
+    "233740",  # KODEX 코스닥150레버리지 (거래세 0% 면제, 백테스트 수익팩터 2.03)
+    "122630",  # KODEX 레버리지 (거래세 0% 면제)
     "005930",  # 삼성전자
     "000660",  # SK하이닉스
     "196170",  # 알테오젠
@@ -17,9 +21,7 @@ DEFAULT_MOMENTUM_UNIVERSE = [
     "028300",  # HLB
     "068270",  # 셀트리온
     "035420",  # NAVER
-    "035720",  # 카카오
     "005380",  # 현대차
-    "000270"   # 기아
 ]
 
 
@@ -38,7 +40,10 @@ class SlotCVolatilityBreakout(BaseStrategy):
             universe=list(DEFAULT_MOMENTUM_UNIVERSE)
         )
         self.jev_client = jev_client
+        self.k_factor: float = 0.5                      # 래리 윌리엄스 표준 k계수 (k=0.5)
         self.target_prices: Dict[str, float] = {}       # 종목별 래리 돌파 목표가
+        self.open_prices: Dict[str, float] = {}         # 종목별 당일 시초가
+        self.prev_ranges: Dict[str, float] = {}         # 종목별 전일 변동폭 (고가 - 저가)
         self.avg_volumes: Dict[str, float] = {}         # 20분 평균 거래량
         self.recent_1m_volumes: Dict[str, float] = {}   # 직전 1분 거래량
         self.max_stocks: int = 4
@@ -52,9 +57,33 @@ class SlotCVolatilityBreakout(BaseStrategy):
         self.trailing_drop_rate: float = 1.0            # 최고가 대비 -1.0% 반락 시 익절
         self.stop_loss_rate: float = -2.8               # 일중 휩소 노이즈 방어를 위해 -2.8%로 유연화
 
-    def update_watchlist(self, top_tickers: List[str], target_prices_map: Dict[str, float]):
+    def update_watchlist(self, top_tickers: List[str], target_prices_map: Dict[str, float], prev_ranges_map: Optional[Dict[str, float]] = None):
         self.universe = top_tickers[:25]
         self.target_prices.update(target_prices_map)
+        if prev_ranges_map:
+            self.prev_ranges.update(prev_ranges_map)
+
+    async def run_morning_calibration(self):
+        """08:45 장전 루틴: pykrx로 감시 종목의 전일 변동폭(prev_ranges)과 전일 분당 평균 거래량(avg_volumes) 사전 로드"""
+        try:
+            from pykrx import stock
+            from datetime import timedelta
+            today = datetime.now()
+            today_str = today.strftime("%Y%m%d")
+            start_str = (today - timedelta(days=10)).strftime("%Y%m%d")
+            for ticker in self.universe[:15]:
+                df = stock.get_market_ohlcv_by_date(start_str, today_str, ticker)
+                if df is not None and len(df) >= 2:
+                    prev_row = df.iloc[-2] if today.strftime("%Y-%m-%d") in str(df.index[-1]) else df.iloc[-1]
+                    high_p = float(prev_row["고가"])
+                    low_p = float(prev_row["저가"])
+                    vol = float(prev_row["거래량"])
+                    self.prev_ranges[ticker] = max(1.0, high_p - low_p)
+                    # 정규장 390분(09:00~15:30) 분당 평균 거래량 추정
+                    self.avg_volumes[ticker] = max(100.0, vol / 390.0)
+            logger.info(f"✅ [{self.name}] 08:45 실증 전일변동폭 및 분당평균거래량 캘리브레이션 완료 ({len(self.prev_ranges)}종목)")
+        except Exception as e:
+            logger.info(f"[{self.name}] 캘리브레이션 폴백: {e}")
 
     async def evaluate_market(
         self,
@@ -69,6 +98,8 @@ class SlotCVolatilityBreakout(BaseStrategy):
         if ask_price <= 0 or bid_price <= 0:
             return None
 
+        asset_type = "ETF" if tick.ticker in ETF_UNIVERSE_SET else "STOCK"
+
         # 1. 포지션 보유 중인 경우 -> 청산(15:15 타임아웃, 트레일링 익절, 절대 손절) 검사
         if current_position:
             pnl_rate = ((bid_price - current_position.entry_price) / current_position.entry_price) * 100.0
@@ -80,7 +111,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
-                    asset_type="STOCK",
+                    asset_type=current_position.asset_type,
                     action="SELL",
                     order_type="MARKET_BREAKOUT",
                     price=bid_price,
@@ -111,7 +142,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
                     return Signal(
                         slot_id=self.slot_id,
                         ticker=tick.ticker,
-                        asset_type="STOCK",
+                        asset_type=current_position.asset_type,
                         action="SELL",
                         order_type="MARKET_BREAKOUT",
                         price=bid_price,
@@ -127,7 +158,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
-                    asset_type="STOCK",
+                    asset_type=current_position.asset_type,
                     action="SELL",
                     order_type="MARKET_BREAKOUT",
                     price=bid_price,
@@ -144,16 +175,21 @@ class SlotCVolatilityBreakout(BaseStrategy):
             return None
 
         # 종목별 당일 시초가 기록 및 변동성 돌파 목표가 산출
-        if not hasattr(self, "open_prices"):
-            self.open_prices = {}
         if tick.ticker not in self.open_prices:
             self.open_prices[tick.ticker] = tick.price
+            if tick.ticker not in self.avg_volumes and tick.volume > 0:
+                self.avg_volumes[tick.ticker] = float(tick.volume)
 
         open_p = self.open_prices[tick.ticker]
-        # 래리 윌리엄스 변동성 돌파: 시초가 대비 +1.0% 상승 돌파 시 매수 신호
-        target_price = self.target_prices.get(tick.ticker, round(open_p * 1.01, 2))
+        prev_range = self.prev_ranges.get(tick.ticker, open_p * 0.02)
+        # 래리 윌리엄스 변동성 돌파 정석: 목표가 = 시초가 + k * (전일 고가 - 전일 저가)
+        computed_target = round(open_p + (self.k_factor * prev_range), 2)
+        target_price = self.target_prices.get(tick.ticker, computed_target)
         avg_vol = self.avg_volumes.get(tick.ticker, 1000.0)
-        vol_1m = self.recent_1m_volumes.get(tick.ticker, max(float(tick.volume), 3000.0))
+        vol_1m = self.recent_1m_volumes.get(
+            tick.ticker,
+            float(tick.volume) if tick.volume > 0 else (avg_vol * 2.5)
+        )
 
         # 1단계: 로컬 정량 필터 (0.1ms, $0)
         passed_stage1, reason1 = self.jev_client.check_stage1_filter(
@@ -177,11 +213,11 @@ class SlotCVolatilityBreakout(BaseStrategy):
         if is_approved:
             qty = int(self.capital_per_stock // ask_price)
             if qty > 0:
-                logger.info(f"⚡ [슬롯 C 진입 승인] {tick.ticker} (가짜돌파확률: {fakeout_prob:.2f}) -> {qty}주 매수")
+                logger.info(f"⚡ [슬롯 C 진입 승인] {tick.ticker} ({asset_type}, 가짜돌파확률: {fakeout_prob:.2f}) -> {qty}주 매수")
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
-                    asset_type="STOCK",
+                    asset_type=asset_type,
                     action="BUY",
                     order_type="MARKET_BREAKOUT",
                     price=ask_price,
@@ -192,3 +228,10 @@ class SlotCVolatilityBreakout(BaseStrategy):
                 )
 
         return None
+
+    def reset_daily_state(self):
+        """매일 장 시작 전(08:45) 일일 상태 초기화"""
+        self.open_prices.clear()
+        self.high_watermarks.clear()
+        self.trailing_active.clear()
+        self.recent_1m_volumes.clear()

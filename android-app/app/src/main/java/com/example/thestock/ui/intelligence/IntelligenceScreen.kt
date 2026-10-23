@@ -2,6 +2,7 @@ package com.example.thestock.ui.intelligence
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,7 +12,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -31,9 +32,11 @@ import java.util.Locale
 fun IntelligenceScreen(
     recentTrades: List<TradeRecordDto>,
     intelligence: IntelligenceDto = IntelligenceDto(),
+    settlementHistory: List<com.example.thestock.data.DailySettlementDto> = emptyList(),
     modifier: Modifier = Modifier
 ) {
     val wonFormat = NumberFormat.getNumberInstance(Locale.KOREA)
+    var selectedDate by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf("LATEST") }
 
     LazyColumn(
         modifier = modifier
@@ -94,15 +97,57 @@ fun IntelligenceScreen(
                         }
                     }
 
-                    Spacer(Modifier.height(14.dp))
+                    Spacer(Modifier.height(12.dp))
 
-                    val reviewText = if (intelligence.daily_review.isNotBlank()) {
-                        intelligence.daily_review
-                    } else {
-                        "### 📊 [Antigravity AI] 15:40 당일 매매 결산 및 복기 리포트\n" +
-                        "- **전체 운용 성과**: 4개 슬롯 가상 자본금(각 1,000만 원, 총 4,000만 원) 정상 운용 중.\n" +
-                        "- **인프라 안정성**: 네트워크 단절 Emergency Flush 없이 SQLite 가상 원장 및 Firebase RTDB 무결점 가동 완료.\n" +
-                        "- **익일 준비**: 장마감 후 외인·기관 연속 순매수 우량주 스크리닝 완료, D+1 시초가 매수 후보 선정."
+                    if (settlementHistory.isNotEmpty()) {
+                        androidx.compose.foundation.lazy.LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            item {
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (selectedDate == "LATEST") CyberCyan else SurfaceVariantDark,
+                                    border = BorderStroke(1.dp, if (selectedDate == "LATEST") CyberCyan else SurfaceBorder),
+                                    modifier = Modifier.clickable { selectedDate = "LATEST" }
+                                ) {
+                                    Text(
+                                        text = "최신(오늘)",
+                                        color = if (selectedDate == "LATEST") BackgroundDark else TextSecondary,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                            items(settlementHistory) { hist ->
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (selectedDate == hist.date) CyberCyan else SurfaceVariantDark,
+                                    border = BorderStroke(1.dp, if (selectedDate == hist.date) CyberCyan else SurfaceBorder),
+                                    modifier = Modifier.clickable { selectedDate = hist.date }
+                                ) {
+                                    Text(
+                                        text = hist.date.takeLast(5),
+                                        color = if (selectedDate == hist.date) BackgroundDark else TextSecondary,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    }
+
+                    val chosenHist = settlementHistory.find { it.date == selectedDate }
+                    val reviewText = when {
+                        selectedDate != "LATEST" && chosenHist != null && chosenHist.review_markdown.isNotBlank() -> chosenHist.review_markdown
+                        intelligence.daily_review.isNotBlank() -> intelligence.daily_review
+                        else -> "### 📊 [Antigravity AI] 15:40 당일 매매 결산 및 복기 리포트\n" +
+                                "- **전체 운용 성과**: 4개 슬롯 가상 자본금(각 1,000만 원, 총 4,000만 원) 정상 운용 중.\n" +
+                                "- **인프라 안정성**: 네트워크 단절 Emergency Flush 없이 SQLite 가상 원장 및 Firebase RTDB 무결점 가동 완료.\n" +
+                                "- **익일 준비**: 장마감 후 외인·기관 연속 순매수 우량주 스크리닝 완료, D+1 시초가 매수 후보 선정."
                     }
 
                     // 리포트 마크다운 본문 파싱 렌더링

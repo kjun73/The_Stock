@@ -94,10 +94,10 @@ class ApkFileHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             local_ip = get_local_ip()
             data = json.dumps({
-                "versionCode": 5,
-                "versionName": "1.0.4",
+                "versionCode": 7,
+                "versionName": "1.0.9",
                 "apkUrl": f"http://{local_ip}:8080/The_Stock_C2.apk",
-                "notes": "15:40 AI 일일 결산 복기 및 장후 스크리닝 후보군 실시간 연동",
+                "notes": "v1.0.9 KRX 공식 연동, 14일 자산 곡선(Equity Curve), 본전/트레일링 배지, 청산 손익비 요약 및 날짜별 복기 뷰어 탑재",
                 "isForce": False,
                 "hasApk": APK_PATH.is_file()
             }, ensure_ascii=False)

@@ -319,18 +319,30 @@ class GeminiAnalyst:
 
 
     async def _call_gemini(self, prompt: str) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.api_key}"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        headers = {
+            "x-goog-api-key": self.api_key,
+            "Content-Type": "application/json"
+        }
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1000}
         }
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.post(url, json=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                return f"Gemini API 응답 오류: HTTP {res.status_code}"
-        except Exception as e:
-            logger.error(f"Gemini API 호출 실패: {e}")
-            return f"Gemini 분석 호출 실패: {e}"
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    res = await client.post(url, headers=headers, json=payload)
+                    if res.status_code == 200:
+                        data = res.json()
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    elif res.status_code == 429 and attempt == 0:
+                        await asyncio.sleep(2.0)
+                        continue
+                    return f"Gemini API 응답 오류: HTTP {res.status_code}"
+            except Exception as e:
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                logger.error(f"Gemini API 호출 실패: {e}")
+                return f"Gemini 분석 호출 실패: {e}"
+        return "Gemini 분석 호출 실패"

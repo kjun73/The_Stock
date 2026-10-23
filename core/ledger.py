@@ -1,3 +1,4 @@
+import asyncio
 import aiosqlite
 import sqlite3
 from datetime import datetime
@@ -27,10 +28,32 @@ DEFAULT_SLOTS = [
 class SqliteLedger:
     def __init__(self, db_path: str = settings.DB_PATH):
         self.db_path = db_path
+        self._db: Optional[aiosqlite.Connection] = None
+        self._lock: Optional[asyncio.Lock] = None
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def get_connection(self) -> aiosqlite.Connection:
+        if self._db is None:
+            self._db = await aiosqlite.connect(self.db_path)
+            self._db.row_factory = aiosqlite.Row
+            await self._db.execute("PRAGMA journal_mode=WAL;")
+            await self._db.execute("PRAGMA busy_timeout=5000;")
+        return self._db
+
+    async def close(self):
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
 
     async def init_db(self):
         """데이터베이스 및 4개 슬롯 가상 원장 테이블 초기화"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.lock:
+            db = await self.get_connection()
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS slot_accounts (
                     slot_id TEXT PRIMARY KEY,
@@ -120,13 +143,12 @@ class SqliteLedger:
 
     async def get_accounts(self) -> List[SlotAccount]:
         """전체 슬롯 계좌 현황 조회"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             cursor = await db.execute("SELECT * FROM slot_accounts")
             rows = await cursor.fetchall()
             accounts = []
             for r in rows:
-                # 활성 포지션 수 조회
                 c_pos = await db.execute(
                     "SELECT COUNT(*) FROM slot_positions WHERE slot_id = ?",
                     (r["slot_id"],)
@@ -149,8 +171,8 @@ class SqliteLedger:
 
     async def get_slot_account(self, slot_id: str) -> Optional[SlotAccount]:
         """특정 슬롯 계좌 현황 단일 조회"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             cursor = await db.execute("SELECT * FROM slot_accounts WHERE slot_id = ?", (slot_id,))
             row = await cursor.fetchone()
             if not row:
@@ -174,9 +196,9 @@ class SqliteLedger:
             )
 
     async def get_positions(self, slot_id: Optional[str] = None) -> List[SlotPosition]:
-        """보유 포지션 조회"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        """보유 포지션 조회 (entry_time 대비 실제 영업일 경과 일수 자동 계산 반영)"""
+        async with self.lock:
+            db = await self.get_connection()
             query = "SELECT * FROM slot_positions"
             params = ()
             if slot_id:
@@ -186,8 +208,23 @@ class SqliteLedger:
             cursor = await db.execute(query, params)
             rows = await cursor.fetchall()
             positions = []
+            now_date = datetime.now().date()
+            from datetime import timedelta
             for r in rows:
                 pos_name = r["name"] if "name" in r.keys() and r["name"] else STOCK_NAME_MAP.get(r["ticker"], "")
+                raw_entry = r["entry_time"]
+                entry_dt = datetime.fromisoformat(raw_entry) if isinstance(raw_entry, str) else raw_entry
+
+                # entry_dt부터 오늘까지의 영업일(월~금) 경과 일수 자동 계산
+                calc_days = 0
+                if isinstance(entry_dt, datetime) and entry_dt.date() < now_date:
+                    cur_d = entry_dt.date()
+                    while cur_d < now_date:
+                        cur_d += timedelta(days=1)
+                        if cur_d.weekday() < 5:
+                            calc_days += 1
+                effective_holding_days = max(int(r["holding_days"] or 0), calc_days)
+
                 positions.append(SlotPosition(
                     slot_id=r["slot_id"],
                     ticker=r["ticker"],
@@ -199,10 +236,36 @@ class SqliteLedger:
                     stop_loss_price=r["stop_loss_price"],
                     take_profit_price=r["take_profit_price"],
                     profit_rate=r["profit_rate"],
-                    entry_time=datetime.fromisoformat(r["entry_time"]) if isinstance(r["entry_time"], str) else r["entry_time"],
-                    holding_days=r["holding_days"]
+                    entry_time=entry_dt,
+                    holding_days=effective_holding_days
                 ))
             return positions
+
+    async def refresh_holding_days(self):
+        """장전 루틴: DB slot_positions의 holding_days 컬럼을 실제 영업일 경과 수치로 일괄 갱신"""
+        async with self.lock:
+            db = await self.get_connection()
+            cursor = await db.execute("SELECT slot_id, ticker, entry_time, holding_days FROM slot_positions")
+            rows = await cursor.fetchall()
+            now_date = datetime.now().date()
+            from datetime import timedelta
+            for r in rows:
+                raw_entry = r["entry_time"]
+                entry_dt = datetime.fromisoformat(raw_entry) if isinstance(raw_entry, str) else raw_entry
+                calc_days = 0
+                if isinstance(entry_dt, datetime) and entry_dt.date() < now_date:
+                    cur_d = entry_dt.date()
+                    while cur_d < now_date:
+                        cur_d += timedelta(days=1)
+                        if cur_d.weekday() < 5:
+                            calc_days += 1
+                effective_days = max(int(r["holding_days"] or 0), calc_days)
+                if effective_days != r["holding_days"]:
+                    await db.execute(
+                        "UPDATE slot_positions SET holding_days = ? WHERE slot_id = ? AND ticker = ?",
+                        (effective_days, r["slot_id"], r["ticker"])
+                    )
+            await db.commit()
 
     async def open_position(self, signal: Signal, tick: TickData) -> Optional[SlotPosition]:
         """
@@ -216,8 +279,8 @@ class SqliteLedger:
 
         stock_name = signal.name or STOCK_NAME_MAP.get(signal.ticker, "")
 
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             # 잔고 확인
             cursor = await db.execute(
                 "SELECT cash_balance, is_active FROM slot_accounts WHERE slot_id = ?",
@@ -230,7 +293,7 @@ class SqliteLedger:
             new_cash = row[0] - total_required_cash
             stop_loss = signal.stop_loss_price or round(exec_price * 0.965, 2)
 
-            # 포지션 삽입/갱신 (분할 매수 시 수량 누적 및 평단가 재계산)
+            # 포지션 삽입/갱신 (분할 매수 시 수량 누적, 평단가 및 손절/익절가 비례 재계산)
             await db.execute("""
                 INSERT INTO slot_positions 
                 (slot_id, ticker, name, asset_type, quantity, entry_price, current_price, stop_loss_price, take_profit_price, profit_rate)
@@ -238,6 +301,17 @@ class SqliteLedger:
                 ON CONFLICT(slot_id, ticker) DO UPDATE SET
                     entry_price = (entry_price * quantity + excluded.entry_price * excluded.quantity) / (quantity + excluded.quantity),
                     quantity = quantity + excluded.quantity,
+                    current_price = excluded.current_price,
+                    stop_loss_price = CASE 
+                        WHEN excluded.stop_loss_price > 0 AND excluded.entry_price > 0 
+                        THEN round(((entry_price * quantity + excluded.entry_price * excluded.quantity) / (quantity + excluded.quantity)) * (excluded.stop_loss_price / excluded.entry_price), 2)
+                        ELSE round(((entry_price * quantity + excluded.entry_price * excluded.quantity) / (quantity + excluded.quantity)) * 0.965, 2)
+                    END,
+                    take_profit_price = CASE 
+                        WHEN excluded.take_profit_price > 0 AND excluded.entry_price > 0 
+                        THEN round(((entry_price * quantity + excluded.entry_price * excluded.quantity) / (quantity + excluded.quantity)) * (excluded.take_profit_price / excluded.entry_price), 2)
+                        ELSE take_profit_price 
+                    END,
                     name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END
             """, (
                 signal.slot_id,
@@ -309,8 +383,8 @@ class SqliteLedger:
         보유 포지션 청산 및 차등 세금/수수료 정산:
         - quantity 지정 시 부분 청산 지원 (지정 안 하거나 보유 수량 이상이면 전량 청산)
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             cursor = await db.execute(
                 "SELECT * FROM slot_positions WHERE slot_id = ? AND ticker = ?",
                 (slot_id, ticker)
@@ -381,7 +455,8 @@ class SqliteLedger:
             trade_id = c_ins.lastrowid
             await db.commit()
 
-        await self.update_market_prices({ticker: tick.price})
+            # 락 내에서 실시간 자산 재계산 (동일 커넥션 사용, 데드락 방지)
+            await self._update_market_prices_unlocked(db, {ticker: tick.price})
 
         return TradeRecord(
             id=trade_id,
@@ -400,42 +475,48 @@ class SqliteLedger:
             exit_reason=exit_reason
         )
 
+    async def _update_market_prices_unlocked(self, db: aiosqlite.Connection, price_map: Dict[str, float]):
+        """이미 락을 보유한 상태에서 호출되는 자산 및 평가손익 갱신 헬퍼"""
+        for ticker, price in price_map.items():
+            await db.execute("""
+                UPDATE slot_positions 
+                SET current_price = ?,
+                    profit_rate = ROUND(((? - entry_price) / entry_price) * 100.0, 2)
+                WHERE ticker = ?
+            """, (price, price, ticker))
+
+        # 슬롯별 총 평가금액 갱신
+        cursor = await db.execute("SELECT slot_id FROM slot_accounts")
+        slot_ids = [r[0] for r in await cursor.fetchall()]
+
+        for s_id in slot_ids:
+            c_val = await db.execute("""
+                SELECT COALESCE(SUM(current_price * quantity), 0.0) 
+                FROM slot_positions WHERE slot_id = ?
+            """, (s_id,))
+            stock_val = (await c_val.fetchone())[0]
+
+            await db.execute("""
+                UPDATE slot_accounts 
+                SET stock_value = ?,
+                    total_asset = cash_balance + ?,
+                    total_profit = (cash_balance + ? - initial_capital),
+                    profit_rate = ROUND(((cash_balance + ? - initial_capital) / initial_capital) * 100.0, 2)
+                WHERE slot_id = ?
+            """, (stock_val, stock_val, stock_val, stock_val, s_id))
+
+        await db.commit()
+
     async def update_market_prices(self, price_map: Dict[str, float]):
-        """실시간 시세 반영하여 평가손익 및 계좌 총자산 재계산"""
-        async with aiosqlite.connect(self.db_path) as db:
-            for ticker, price in price_map.items():
-                await db.execute("""
-                    UPDATE slot_positions 
-                    SET current_price = ?,
-                        profit_rate = ROUND(((? - entry_price) / entry_price) * 100.0, 2)
-                    WHERE ticker = ?
-                """, (price, price, ticker))
-
-            # 슬롯별 총 평가금액 갱신
-            cursor = await db.execute("SELECT slot_id FROM slot_accounts")
-            slot_ids = [r[0] for r in await cursor.fetchall()]
-
-            for s_id in slot_ids:
-                c_val = await db.execute("""
-                    SELECT COALESCE(SUM(current_price * quantity), 0.0) 
-                    FROM slot_positions WHERE slot_id = ?
-                """, (s_id,))
-                stock_val = (await c_val.fetchone())[0]
-
-                await db.execute("""
-                    UPDATE slot_accounts 
-                    SET stock_value = ?,
-                        total_asset = cash_balance + ?,
-                        total_profit = (cash_balance + ? - initial_capital),
-                        profit_rate = ROUND(((cash_balance + ? - initial_capital) / initial_capital) * 100.0, 2)
-                    WHERE slot_id = ?
-                """, (stock_val, stock_val, stock_val, stock_val, s_id))
-
-            await db.commit()
+        """실시간 시세 반영하여 평가손익 및 계좌 총자산 재계산 (외부 호출용)"""
+        async with self.lock:
+            db = await self.get_connection()
+            await self._update_market_prices_unlocked(db, price_map)
 
     async def set_slot_active(self, slot_id: str, is_active: bool):
         """특정 슬롯 활성화/비활성화 상태 업데이트"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.lock:
+            db = await self.get_connection()
             await db.execute(
                 "UPDATE slot_accounts SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE slot_id = ?",
                 (1 if is_active else 0, slot_id)
@@ -444,7 +525,8 @@ class SqliteLedger:
 
     async def update_stop_loss_price(self, slot_id: str, ticker: str, new_stop_loss_price: float):
         """보유 포지션의 손절가를 상향(Breakeven 또는 Trailing) 갱신"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.lock:
+            db = await self.get_connection()
             await db.execute(
                 "UPDATE slot_positions SET stop_loss_price = ? WHERE slot_id = ? AND ticker = ?",
                 (new_stop_loss_price, slot_id, ticker)
@@ -457,8 +539,8 @@ class SqliteLedger:
         limit: int = 20
     ) -> List[TradeRecord]:
         """최근 체결/청산 거래 내역 조회"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             query = "SELECT * FROM trade_records"
             params = []
             if slot_id:
@@ -497,8 +579,8 @@ class SqliteLedger:
         slot_id: Optional[str] = None
     ) -> List[TradeRecord]:
         """최근 N일간의 체결 거래 내역 조회"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             query = "SELECT * FROM trade_records WHERE exit_time >= datetime('now', ? || ' days')"
             params = [f"-{days}"]
             if slot_id:
@@ -567,6 +649,13 @@ class SqliteLedger:
         else:
             kelly_f = w - ((1.0 - w) / r)
 
+        if r <= 0 or kelly_f <= 0:
+            # 기대값 마이너스 또는 연패 구간: 사용자 승인 정책에 따라 최소 방어 금액(100만 원)으로 탐색 매매
+            account = await self.get_slot_account(slot_id)
+            if not account or account.cash_balance <= 0:
+                return default_capital
+            return min(1_000_000.0, account.cash_balance)
+
         half_kelly = 0.5 * kelly_f
         clamped_ratio = max(min_ratio, min(half_kelly, max_ratio))
 
@@ -592,7 +681,8 @@ class SqliteLedger:
         screening_json: str = "{}"
     ) -> DailySettlement:
         """일일 장마감 결산 스냅샷 및 AI 복기 결과를 SQLite 원장에 영구 기록 (UPSERT)"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.lock:
+            db = await self.get_connection()
             await db.execute("""
                 INSERT OR REPLACE INTO daily_settlements (
                     date, total_asset, cash_balance, stock_value,
@@ -622,8 +712,8 @@ class SqliteLedger:
 
     async def get_daily_settlements(self, limit: int = 30) -> List[DailySettlement]:
         """최근 일일 결산/복기 히스토리 목록 조회"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             cursor = await db.execute(
                 "SELECT * FROM daily_settlements ORDER BY date DESC LIMIT ?",
                 (limit,)
@@ -649,8 +739,8 @@ class SqliteLedger:
 
     async def get_daily_settlement(self, date: str) -> Optional[DailySettlement]:
         """특정 일자의 결산/복기 조회"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.lock:
+            db = await self.get_connection()
             cursor = await db.execute(
                 "SELECT * FROM daily_settlements WHERE date = ?",
                 (date,)

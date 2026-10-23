@@ -76,9 +76,18 @@ fun MainScreen(
         }
     }
 
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(viewModel) {
+        viewModel.uiMessage.collect { message ->
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
     Scaffold(
         modifier = modifier.fillMaxSize(),
         containerColor = BackgroundDark,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             NavigationBar(
                 containerColor = SurfaceDark,
@@ -118,7 +127,9 @@ fun MainScreen(
                     onSlotClick = { slotId ->
                         targetSlotId = slotId
                         selectedTab = MainTab.POSITIONS
-                    }
+                    },
+                    serverControlState = serverControlState,
+                    settlementHistory = status.settlement_history
                 )
                 MainTab.POSITIONS -> PositionsScreen(
                     slots = status.slots,
@@ -129,7 +140,8 @@ fun MainScreen(
                 )
                 MainTab.INTELLIGENCE -> IntelligenceScreen(
                     recentTrades = status.recent_trades,
-                    intelligence = status.intelligence
+                    intelligence = status.intelligence,
+                    settlementHistory = status.settlement_history
                 )
                 MainTab.SETTINGS -> SettingsScreen(
                     currentUrl = serverUrl,

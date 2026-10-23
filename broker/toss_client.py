@@ -97,10 +97,22 @@ class TossClient:
         self.is_connected: bool = False
         self._tick_callbacks: List[Callable[[TickData], asyncio.Future]] = []
         self._polling_task: Optional[asyncio.Task] = None
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._session_open_prices: Dict[str, float] = {}
 
         # 오케스트레이터 호환 구독 매니저
         self.subscription_manager = TossSubscriptionManager()
         self.quota_manager = self.subscription_manager  # 하위 호환성 별칭
+
+    async def get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=4.0)
+        return self._http_client
+
+    async def close(self):
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
 
     def register_tick_callback(self, callback):
         self._tick_callbacks.append(callback)
@@ -127,30 +139,32 @@ class TossClient:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                res = await client.post(url, data=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    self.access_token = data.get("access_token")
-                    expires_in = int(data.get("expires_in", 86400))
-                    self.token_expired_at = now + expires_in - 300
-                    self.is_connected = True
-                    logger.info("🔑 [TossClient] 토스증권 Access Token 발급 완료!")
-                    return self.access_token
-                else:
-                    logger.warning(f"토스 토큰 발급 응답 에러 (HTTP {res.status_code}): {res.text}")
-                    self.access_token = "mock_toss_fallback"
-                    return self.access_token
+            client = await self.get_http_client()
+            res = await client.post(url, data=payload)
+            if res.status_code == 200:
+                data = res.json()
+                self.access_token = data.get("access_token")
+                expires_in = int(data.get("expires_in", 86400))
+                self.token_expired_at = now + expires_in - 300
+                self.is_connected = True
+                logger.info("🔑 [TossClient] 토스증권 Access Token 발급 완료!")
+                return self.access_token
+            else:
+                logger.warning(f"토스 토큰 발급 응답 에러 (HTTP {res.status_code}): {res.text}")
+                self.access_token = "mock_toss_fallback"
+                self.token_expired_at = now + 300  # 5분간 재시도 자제하여 429 방지
+                return self.access_token
         except Exception as e:
             logger.error(f"토스증권 토큰 발급 실패: {e}")
             self.access_token = "mock_toss_fallback"
+            self.token_expired_at = now + 300  # 5분간 재시도 자제
             return self.access_token
 
     async def get_realtime_prices_batch(self, tickers: List[str]) -> Dict[str, TickData]:
         """
         토스증권 공식 다중 종목 배치(Batch) 현재가 조회:
         'GET /api/v1/prices?symbols=005930,000660,...'
-        최대 30개 단위로 청킹하여 단 1~2회의 HTTP 호출로 전체 유니버스 시세를 즉각 수신
+        보유 종목을 1번 청크에 우선 배치하여 손절/익절 시세 수신 보장
         """
         if not tickers:
             return {}
@@ -179,35 +193,63 @@ class TossClient:
         headers = {"Authorization": f"Bearer {token}"}
         result: Dict[str, TickData] = {}
 
-        # 30개씩 분할하여 청크 호출 (URL 길이 및 응답 패킷 최적화)
+        # 보유 종목(held_positions)을 첫 번째 청크에 최우선 배치
+        held_set = set(self.subscription_manager.held_positions)
+        sorted_tickers = sorted(tickers, key=lambda t: 0 if t in held_set else 1)
+
+        # 30개씩 분할하여 청크 호출
         chunk_size = 30
-        chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+        chunks = [sorted_tickers[i:i + chunk_size] for i in range(0, len(sorted_tickers), chunk_size)]
 
         try:
-            async with httpx.AsyncClient(timeout=4.0) as client:
-                for chunk in chunks:
-                    symbols_param = ",".join(chunk)
-                    res = await client.get(url_price, headers=headers, params={"symbols": symbols_param})
-                    if res.status_code == 200:
-                        items = res.json().get("result", [])
-                        for item in items:
+            client = await self.get_http_client()
+            for chunk in chunks:
+                symbols_param = ",".join(chunk)
+                res = await client.get(url_price, headers=headers, params={"symbols": symbols_param})
+                if res.status_code == 200:
+                    items = res.json().get("result", [])
+                    for item in items:
+                        sym = item.get("symbol")
+                        price = float(item.get("lastPrice", 0.0))
+                        if not sym or price <= 0:
+                            continue
+                        vol = int(item.get("volume", 1000))
+                        base_open = self._session_open_prices.setdefault(sym, price)
+                        chg_pct = ((price - base_open) / base_open) * 100.0 if base_open > 0 else 0.0
+                        dyn_strength = round(max(80.0, min(160.0, 112.0 + (chg_pct * 10.0))), 1)
+                        result[sym] = TickData(
+                            ticker=sym,
+                            price=price,
+                            bid_price=round(price * 0.999, 2),
+                            ask_price=round(price * 1.001, 2),
+                            volume=vol,
+                            exec_strength=dyn_strength,
+                            timestamp=now_dt
+                        )
+                elif res.status_code == 429:
+                    logger.warning("⚠️ [TossClient] 429 Too Many Requests 감지! 1.5초 대기 후 재시도")
+                    await asyncio.sleep(1.5)
+                    # 1회 백오프 재시도
+                    retry_res = await client.get(url_price, headers=headers, params={"symbols": symbols_param})
+                    if retry_res.status_code == 200:
+                        for item in retry_res.json().get("result", []):
                             sym = item.get("symbol")
                             price = float(item.get("lastPrice", 0.0))
                             if not sym or price <= 0:
                                 continue
-                            vol = int(item.get("volume", 1000))
+                            base_open = self._session_open_prices.setdefault(sym, price)
+                            chg_pct = ((price - base_open) / base_open) * 100.0 if base_open > 0 else 0.0
+                            dyn_strength = round(max(80.0, min(160.0, 112.0 + (chg_pct * 10.0))), 1)
                             result[sym] = TickData(
                                 ticker=sym,
                                 price=price,
-                                bid_price=round(price * 0.999, 2),  # 기본 1호가 스프레드 추정
+                                bid_price=round(price * 0.999, 2),
                                 ask_price=round(price * 1.001, 2),
-                                volume=vol,
-                                exec_strength=110.0,
+                                volume=int(item.get("volume", 1000)),
+                                exec_strength=dyn_strength,
                                 timestamp=now_dt
                             )
-                    elif res.status_code == 429:
-                        logger.warning("⚠️ [TossClient] 429 Too Many Requests 감지! 1초 대기")
-                        await asyncio.sleep(1.0)
+                    else:
                         break
         except Exception as e:
             logger.warning(f"토스 배치 시세 조회 실패: {e}")
@@ -227,15 +269,14 @@ class TossClient:
         headers = {"Authorization": f"Bearer {token}"}
 
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                res = await client.get(url_book, headers=headers, params={"symbol": ticker})
-                if res.status_code == 200:
-                    book_data = res.json().get("result", {})
-                    asks = book_data.get("asks", [])
-                    bids = book_data.get("bids", [])
-                    ask_price = float(asks[0].get("price", 0.0)) if asks else 0.0
-                    bid_price = float(bids[0].get("price", 0.0)) if bids else 0.0
-                    return (bid_price, ask_price)
+            client = await self.get_http_client()
+            res = await client.get(url_book, headers=headers, params={"symbol": ticker})
+            if res.status_code == 200:
+                book_data = res.json().get("result", {})
+                asks = book_data.get("asks", [])
+                ask_price = float(asks[0].get("price", 0.0)) if asks else 0.0
+                bid_price = float(bids[0].get("price", 0.0)) if bids else 0.0
+                return (bid_price, ask_price)
         except Exception:
             pass
 

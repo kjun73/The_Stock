@@ -20,6 +20,7 @@ class JevCascadeClient:
         self.cooldown_tracker: Dict[str, float] = {}  # 종목별 5분 쿨다운 타임스탬프
         self.consecutive_failures: int = 0
         self.circuit_broken: bool = False
+        self.circuit_broken_at: float = 0.0
 
     def check_stage1_filter(
         self,
@@ -76,7 +77,12 @@ class JevCascadeClient:
             return is_approved, sim_prob, "MOCK_JEV_EVALUATION"
 
         if self.circuit_broken:
-            return False, 1.0, "CIRCUIT_BREAKER_ACTIVE_SAFE_REJECT"
+            if (time.time() - self.circuit_broken_at) >= 600.0:
+                logger.info("🔄 [JEV 서킷 브레이커] 10분 경과 -> 서킷 브레이커 자동 해제 및 재가동")
+                self.circuit_broken = False
+                self.consecutive_failures = 0
+            else:
+                return False, 1.0, "CIRCUIT_BREAKER_ACTIVE_SAFE_REJECT"
 
         url = "https://openrouter.ai/api/alpha/decisions"
         headers = {
@@ -151,4 +157,5 @@ class JevCascadeClient:
         self.consecutive_failures += 1
         if self.consecutive_failures >= 5:
             self.circuit_broken = True
-            logger.critical("🚨 [JEV 서킷 브레이커 트립] 5회 연속 실패로 슬롯 C 신규 진입 일시 동결!")
+            self.circuit_broken_at = time.time()
+            logger.critical("🚨 [JEV 서킷 브레이커 트립] 5회 연속 실패로 슬롯 C 신규 진입 10분간 일시 동결!")

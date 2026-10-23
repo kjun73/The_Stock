@@ -106,7 +106,8 @@ async def get_system_status():
     """전체 시스템 현황 및 요약 대시보드 데이터 조회"""
     accounts = await ledger.get_accounts()
     positions = await ledger.get_positions()
-    recent_trades = await ledger.get_recent_trades(limit=5)
+    recent_trades = await ledger.get_recent_trades(limit=50)
+    settlements = await ledger.get_daily_settlements(limit=14)
 
     total_asset = sum(a.total_asset for a in accounts)
     total_cash = sum(a.cash_balance for a in accounts)
@@ -122,6 +123,7 @@ async def get_system_status():
             "initial_capital": initial_capital,
             "total_asset": total_asset,
             "total_cash": total_cash,
+            "total_stock": total_asset - total_cash,
             "total_stock_value": total_asset - total_cash,
             "total_profit": total_profit,
             "total_profit_rate": round(total_profit_rate, 2),
@@ -130,8 +132,11 @@ async def get_system_status():
         "market_filter": {
             "kospi_index": orchestrator.market_filter.kospi_index,
             "kospi_20ma": orchestrator.market_filter.kospi_20ma,
+            "kospi_daily_change_pct": orchestrator.market_filter.kospi_daily_change_pct,
             "is_bear_market": orchestrator.market_filter.is_bear_market,
-            "is_panic_sell_day": orchestrator.market_filter.is_panic_sell_day
+            "is_panic_sell_day": orchestrator.market_filter.is_panic_sell_day,
+            "is_strong_rebound_day": orchestrator.market_filter.is_strong_rebound_day,
+            "is_super_rally_day": orchestrator.market_filter.is_super_rally_day
         },
         "slots_summary": [
             {
@@ -145,6 +150,7 @@ async def get_system_status():
             for a in accounts
         ],
         "recent_trades": [t.model_dump() for t in recent_trades],
+        "settlement_history": [s.model_dump() for s in settlements],
         "intelligence": {
             "daily_review": getattr(orchestrator, "latest_daily_review", ""),
             "morning_briefing": getattr(orchestrator, "latest_morning_briefing", ""),
@@ -238,10 +244,10 @@ async def get_app_version():
     """
     apk_path = Path(__file__).resolve().parent.parent / "android-app" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
     return {
-        "versionCode": 6,
-        "versionName": "1.0.5",
-        "apkUrl": "https://github.com/kjun73/The_Stock/releases/download/v1.0.5/app-debug.apk",
-        "notes": "개장일 자동 기동/종료 엔진 및 모바일 원격 제어 보안 개편",
+        "versionCode": 7,
+        "versionName": "1.0.9",
+        "apkUrl": "https://github.com/kjun73/The_Stock/releases/download/v1.0.9/app-debug.apk",
+        "notes": "v1.0.9 KRX 공식 연동, 14일 자산 곡선(Equity Curve), 본전/트레일링 배지, 청산 손익비 요약 및 날짜별 복기 뷰어 탑재",
         "isForce": False,
         "hasApk": apk_path.is_file()
     }

@@ -3,6 +3,7 @@ package com.example.thestock.data
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -405,5 +406,11 @@ class TradingRepository(
             ),
             recent_trades = emptyList()
         )
+    }
+
+    fun cleanup() {
+        try {
+            scope.cancel()
+        } catch (_: Exception) {}
     }
 }

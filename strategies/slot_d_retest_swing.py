@@ -36,6 +36,8 @@ class SlotDRetestSwing(BaseStrategy):
         self.trailing_active: Dict[str, bool] = {}       # +3.5% 도달 시 트레일링 활성화
         self.trailing_activation_rate: float = 3.5      # +3.5% 도달 시 발동
         self.trailing_drop_rate: float = 1.5            # 최고가 대비 -1.5% 반락 시 익절 확정
+        self.stopped_out_tickers: set[str] = set()      # 당일 손절 발생 종목 재진입 차단 집합
+        self.day_open_prices: Dict[str, float] = {}     # 당일 시초가 기록 (하락 칼날 방어용)
 
     def update_candidates(self, candidates: List[str], support_map: Optional[Dict[str, float]] = None):
         self.selected_candidates = list(candidates[:self.max_stocks])
@@ -44,24 +46,57 @@ class SlotDRetestSwing(BaseStrategy):
             self.support_levels.update(support_map)
         logger.info(f"[{self.name}] 신고가 눌림목 후보군 {len(self.universe)}종목 갱신: {self.universe}")
 
-    async def run_morning_screening(self):
-        """매일 08:45 또는 지연 기동 시 전고점 돌파 첫 눌림목 스윙 후보군 스크리닝"""
+    async def run_morning_screening(self, exclude_tickers: Optional[List[str]] = None):
+        """매일 08:45 또는 지연 기동 시 전고점 돌파 첫 눌림목 스윙 후보군 및 20MA 지지선 스크리닝 (슬롯 A 중복 배제)"""
         logger.info(f"🔍 [{self.name}] 장전/기동 시 신고가 눌림목 후보군 스크리닝 가동...")
-        candidates = ["005930", "000660", "035420", "005380", "068270"]
+        excluded = set(exclude_tickers or [])
+        default_pool = ["035420", "068270", "012450", "267260", "196170", "000270", "005930", "000660", "005380"]
+        candidates = [t for t in default_pool if t not in excluded][:5]
+        if len(candidates) < self.max_stocks:
+            candidates = default_pool[:5]
+
+        support_map: Dict[str, float] = {}
         try:
             from pykrx import stock
-            today_str = datetime.now().strftime("%Y%m%d")
-            # 코스피/코스닥 시총 상위 및 주도주 기반 동적 필터링 시도
-            market_cap = stock.get_market_cap_by_ticker(today_str)
-            if market_cap is not None and not market_cap.empty:
-                top_tickers = list(market_cap.sort_values(by="시가총액", ascending=False).index[:10])
-                if top_tickers:
-                    candidates = top_tickers[:5]
+            from datetime import timedelta
+            today = datetime.now()
+            today_str = today.strftime("%Y%m%d")
+            start_str = (today - timedelta(days=40)).strftime("%Y%m%d")
+
+            # 1순위: KRX 공식 시총 상위 조회 (로그인 세션 활성 시)
+            try:
+                market_cap = stock.get_market_cap_by_ticker(today_str)
+                if market_cap is not None and not market_cap.empty and "시가총액" in market_cap.columns:
+                    top_tickers = [
+                        t for t in market_cap.sort_values(by="시가총액", ascending=False).index[:15]
+                        if t not in excluded
+                    ]
+                    if len(top_tickers) >= self.max_stocks:
+                        candidates = top_tickers[:5]
+            except Exception:
+                pass
+
+            # 2순위: 후보 풀 대상 20일 고점 근접도 및 20MA 지지선 정밀 산출
+            scored_candidates = []
+            for t in candidates:
+                df = stock.get_market_ohlcv_by_date(start_str, today_str, t)
+                if df is not None and len(df) >= 5 and "종가" in df.columns:
+                    closes = df["종가"].tail(20)
+                    ma20 = float(closes.mean())
+                    high20 = float(closes.max())
+                    last_c = float(closes.iloc[-1])
+                    support_map[t] = round(ma20, 0)
+                    near_high_ratio = last_c / high20 if high20 > 0 else 0.0
+                    scored_candidates.append((t, near_high_ratio))
+
+            if scored_candidates:
+                scored_candidates.sort(key=lambda x: x[1], reverse=True)
+                candidates = [x[0] for x in scored_candidates[:self.max_stocks]]
         except Exception as e:
             logger.info(f"[{self.name}] pykrx 동적 스크리닝 폴백 (사유: {e})")
 
-        self.update_candidates(candidates)
-        logger.info(f"✅ [{self.name}] 스크리닝 완료: {self.universe}")
+        self.update_candidates(candidates, support_map if support_map else None)
+        logger.info(f"✅ [{self.name}] 스크리닝 완료: {self.universe} (지지선: {self.support_levels})")
 
     async def evaluate_market(
         self,
@@ -111,8 +146,8 @@ class SlotDRetestSwing(BaseStrategy):
 
             high_price = self.high_watermarks[tick.ticker]
 
-            # 트레일링 모드 활성화 검사 (+3.5% 도달 시)
-            if pnl_rate >= self.trailing_activation_rate:
+            # 트레일링 모드 활성화 검사 (+3.5% 도달 시 또는 오버나잇 복원 시)
+            if pnl_rate >= self.trailing_activation_rate or current_position.stop_loss_price >= current_position.entry_price:
                 self.trailing_active[tick.ticker] = True
 
             # (2) 동적 트레일링 익절: 최고가 대비 1.5% 이상 반락 시 익절 확정
@@ -149,10 +184,11 @@ class SlotDRetestSwing(BaseStrategy):
                         exit_reason="STRATEGY_BREAKEVEN_STOP"
                     )
 
-            # (3) 초기 지지선 붕괴 손절 (-3.0%)
+            # (3) 초기 지지선 붕괴 손절 (-3.0%) -> 당일 동일 종목 재진입 원천 차단
             if pnl_rate <= self.stop_loss_rate:
                 self.high_watermarks.pop(tick.ticker, None)
                 self.trailing_active.pop(tick.ticker, None)
+                self.stopped_out_tickers.add(tick.ticker)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
@@ -183,13 +219,21 @@ class SlotDRetestSwing(BaseStrategy):
 
             return None
 
-        # 2. 미보유 상태 -> 지지선 눌림목 반등 확인 시 매수
+        # 2. 미보유 상태 -> 당일 손절 이력이 없고 지지선 눌림목 반등 확인 시 매수
+        if tick.ticker in self.stopped_out_tickers:
+            return None
+
         if tick.ticker in self.universe:
+            day_open = self.day_open_prices.setdefault(tick.ticker, tick.price)
             support = self.support_levels.get(tick.ticker)
-            # 하드코딩 지지선이 현재가와 5% 이상 괴리된 경우 실시간 시세 기준 전고점 눌림목 지지선(-2.0%)으로 동적 캘리브레이션
-            if support is None or abs(support - tick.price) / tick.price > 0.05:
+            # 지지선이 미설정되었거나 비정상 괴리(>25%)된 경우에만 초기 지지선(-2.0%) 1회 설정 (장중 하락 시 지지선 하향 이동 방지)
+            if support is None or abs(support - tick.price) / tick.price > 0.25:
                 support = round(tick.price * 0.98, 0)
                 self.support_levels[tick.ticker] = support
+
+            # 하락 칼날 방어: 당일 시초가 대비 -0.8% 이상 급락 중이거나 체결강도가 95% 미만이면 진입 보류
+            if tick.price < (day_open * 0.992) or tick.exec_strength < 95.0:
+                return None
 
             # 주가가 지지선 위 1.5% 이내에 위치하면서 매수세 유입 시 (눌림목 타점)
             if support <= ask_price <= (support * 1.015):
@@ -211,3 +255,8 @@ class SlotDRetestSwing(BaseStrategy):
                     )
 
         return None
+
+    def reset_daily_state(self):
+        """매일 장 시작 전(08:45) 당일 손절 블랙리스트 및 시초가 초기화"""
+        self.stopped_out_tickers.clear()
+        self.day_open_prices.clear()

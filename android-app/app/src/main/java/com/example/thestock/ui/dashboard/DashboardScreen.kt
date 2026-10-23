@@ -37,6 +37,8 @@ fun DashboardScreen(
     slots: Map<String, SlotAccountDto>,
     onKillConfirmed: () -> Unit,
     onSlotClick: (String) -> Unit = {},
+    serverControlState: String = "STOPPED",
+    settlementHistory: List<com.example.thestock.data.DailySettlementDto> = emptyList(),
     modifier: Modifier = Modifier
 ) {
     val wonFormat = NumberFormat.getNumberInstance(Locale.KOREA)
@@ -49,7 +51,7 @@ fun DashboardScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         contentPadding = PaddingValues(top = 16.dp, bottom = 24.dp)
     ) {
-        // 1. 상태 헤더 (연결 상태)
+        // 1. 상태 헤더 (3단계 상태: ONLINE / CLOSED / OFFLINE)
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -71,10 +73,16 @@ fun DashboardScreen(
                     )
                 }
 
+                val (statusText, statusColor, statusBg) = when {
+                    isConnected -> Triple("ONLINE", NeonGreen, Color(0x2600E676))
+                    serverControlState == "STOPPED" -> Triple("CLOSED · 대기", CyberCyan, Color(0x2600E5FF))
+                    else -> Triple("OFFLINE", NeonRed, Color(0x33FF1744))
+                }
+
                 Surface(
                     shape = RoundedCornerShape(12.dp),
-                    color = if (isConnected) Color(0x2600E676) else Color(0x33FF1744),
-                    border = BorderStroke(1.dp, if (isConnected) NeonGreen else NeonRed)
+                    color = statusBg,
+                    border = BorderStroke(1.dp, statusColor)
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -84,12 +92,12 @@ fun DashboardScreen(
                             modifier = Modifier
                                 .size(8.dp)
                                 .clip(RoundedCornerShape(4.dp))
-                                .background(if (isConnected) NeonGreen else NeonRed)
+                                .background(statusColor)
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = if (isConnected) "ONLINE" else "OFFLINE",
-                            color = if (isConnected) NeonGreen else NeonRed,
+                            text = statusText,
+                            color = statusColor,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -100,20 +108,32 @@ fun DashboardScreen(
 
         // 2. 코스피 20일선 마켓필터 배너
         item {
+            val changeSign = if (marketFilter.kospi_daily_change_pct >= 0) "+" else ""
+            val changeStr = "${changeSign}${marketFilter.kospi_daily_change_pct}%"
             val (bannerColor, bannerBg, bannerText, bannerIcon) = when {
                 marketFilter.is_panic_sell_day -> Quadruple(
                     NeonRed, PanicBg,
-                    "🛑 당일 급락 패닉셀 발생 (-3% 초과) -> 전 슬롯 신규매수 동결",
+                    "🛑 당일 급락 패닉셀 발생 (${changeStr}) -> 전 슬롯 신규매수 동결",
                     Icons.Default.Warning
+                )
+                marketFilter.is_super_rally_day -> Quadruple(
+                    NeonGreen, Color(0x2600E676),
+                    "🚀 코스피 대폭등 (${changeStr}) -> 하락장 방어막 해제 및 전 슬롯(스윙 포함) 진입 승인",
+                    Icons.Default.CheckCircle
+                )
+                marketFilter.is_strong_rebound_day -> Quadruple(
+                    CyberCyan, Color(0x2600E5FF),
+                    "⚡ 코스피 강반등 (${changeStr}) -> 슬롯 C(단타) 진입 승인 (스윙은 보수적 유지)",
+                    Icons.Default.CheckCircle
                 )
                 marketFilter.is_bear_market -> Quadruple(
                     ElectricYellow, Color(0x26FFD600),
-                    "⚠️ 하락장 방어막 (코스피 < 20MA) -> 슬롯 A/C/D 차단, 슬롯 B(ETF)만 허용",
+                    "⚠️ 하락장 방어막 (코스피 ${marketFilter.kospi_index.toInt()}pt [${changeStr}] < 20MA ${marketFilter.kospi_20ma.toInt()}pt) -> 슬롯 A/C/D 차단, 슬롯 B(ETF)만 허용",
                     Icons.Default.Info
                 )
                 else -> Quadruple(
                     CyberCyan, BearBg,
-                    "🛡️ 상승장 (코스피 ${marketFilter.kospi_index.toInt()} > 20MA ${marketFilter.kospi_20ma.toInt()}) -> 4개 슬롯 정상 가동",
+                    "🛡️ 상승장 (코스피 ${marketFilter.kospi_index.toInt()}pt [${changeStr}] > 20MA ${marketFilter.kospi_20ma.toInt()}pt) -> 4개 슬롯 정상 가동",
                     Icons.Default.CheckCircle
                 )
             }
@@ -195,6 +215,72 @@ fun DashboardScreen(
                         Column(horizontalAlignment = Alignment.End) {
                             Text("보유 종목수", color = TextMuted, fontSize = 11.sp)
                             Text("${portfolio.open_positions_count}개 종목", color = if (portfolio.open_positions_count > 0) NeonGreen else TextMuted, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3-1. 최근 일일 결산 자산 추이 (Equity Curve) 카드
+        if (settlementHistory.isNotEmpty()) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, SurfaceBorder)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "📈 최근 결산 자산 추이 (Equity Curve)",
+                                color = TextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "최근 ${settlementHistory.size}일",
+                                color = TextMuted,
+                                fontSize = 11.sp
+                            )
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        settlementHistory.take(5).forEach { settlement ->
+                            val isPos = settlement.profit_rate >= 0
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 2.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = settlement.date.takeLast(5),
+                                    color = TextSecondary,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(
+                                    text = "${wonFormat.format(settlement.total_asset.toLong())}원",
+                                    color = TextPrimary,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(
+                                    text = "${if (isPos) "+" else ""}${settlement.profit_rate}%",
+                                    color = if (isPos) NeonGreen else NeonRed,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
                         }
                     }
                 }
