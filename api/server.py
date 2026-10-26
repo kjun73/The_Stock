@@ -295,3 +295,16 @@ async def get_weekly_report():
     return {"weekly_review": report}
 
 
+@app.post("/api/reports/morning/refresh")
+async def refresh_morning_briefing():
+    """장전 거시 시황 브리핑 강제 재생성 및 동기화"""
+    briefing = await orchestrator.gemini_analyst.generate_morning_briefing({
+        "kospi_index": orchestrator.market_filter.kospi_index,
+        "kospi_20ma": orchestrator.market_filter.kospi_20ma,
+        "kospi_daily_change_pct": orchestrator.market_filter.kospi_daily_change_pct,
+        "watchlist_count": len(orchestrator.strategies["SLOT_C"].universe)
+    }, force_regenerate=True)
+    orchestrator.latest_morning_briefing = briefing
+    return {"message": "장전 거시 시황 브리핑 갱신 완료", "morning_briefing": briefing}
+
+

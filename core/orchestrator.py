@@ -129,11 +129,12 @@ class TradingOrchestrator:
                 await self.sync_half_kelly_capitals()
 
                 try:
-                    await self.gemini_analyst.generate_morning_briefing({
+                    self.latest_morning_briefing = await self.gemini_analyst.generate_morning_briefing({
                         "kospi_index": self.market_filter.kospi_index,
                         "kospi_20ma": self.market_filter.kospi_20ma,
+                        "kospi_daily_change_pct": self.market_filter.kospi_daily_change_pct,
                         "watchlist_count": len(self.strategies["SLOT_C"].universe)
-                    })
+                    }, force_regenerate=True)
                 except Exception as e:
                     logger.warning(f"장전 브리핑 캐치업 예외: {e}")
 
@@ -563,11 +564,12 @@ class TradingOrchestrator:
                     await self.sync_half_kelly_capitals()
 
                     try:
-                        await self.gemini_analyst.generate_morning_briefing({
+                        self.latest_morning_briefing = await self.gemini_analyst.generate_morning_briefing({
                             "kospi_index": self.market_filter.kospi_index,
                             "kospi_20ma": self.market_filter.kospi_20ma,
+                            "kospi_daily_change_pct": self.market_filter.kospi_daily_change_pct,
                             "watchlist_count": len(self.strategies["SLOT_C"].universe)
-                        })
+                        }, force_regenerate=True)
                     except Exception as e:
                         logger.warning(f"장전 브리핑 예외: {e}")
 

@@ -42,11 +42,12 @@ class GeminiAnalyst:
         file_path = REPORT_DIR / "morning_briefing.md"
         history_path = REPORT_HISTORY_DIR / f"morning_briefing_{today_str}.md"
 
-        if not force_regenerate and file_path.exists():
+        # force_regenerate가 False이고 오늘자 히스토리 파일이 정상 생성되어 있는 경우에만 기존 캐시 반환
+        if not force_regenerate and history_path.exists():
             try:
-                content = file_path.read_text(encoding="utf-8").strip()
-                if content:
-                    logger.info("📄 [GeminiAnalyst] Antigravity가 작성한 reports/morning_briefing.md 로드 완료")
+                content = history_path.read_text(encoding="utf-8").strip()
+                if content and "생성 예정" not in content and "대기" not in content:
+                    logger.info(f"📄 [GeminiAnalyst] 오늘({today_str}) 장전 브리핑 캐시 로드 완료")
                     return content
             except Exception as e:
                 logger.warning(f"브리핑 파일 읽기 실패: {e}")
@@ -66,15 +67,16 @@ class GeminiAnalyst:
         # 3. 기본 Antigravity 시황 분석 포맷
         kospi = market_summary.get("kospi_index", 2600.0)
         ma20 = market_summary.get("kospi_20ma", 2580.0)
+        change_pct = market_summary.get("kospi_daily_change_pct", 0.0)
         is_bull = kospi >= ma20
 
         briefing = (
             "### 🌅 [Antigravity AI] 08:50 장전 거시 시황 브리핑\n"
-            f"- **국내 증시 추세**: 코스피 지수({kospi:.1f}p)가 20일 이동평균선({ma20:.1f}p) "
+            f"- **국내 증시 추세**: 코스피 지수({kospi:,.1f}p, {change_pct:+.2f}%)가 20일 이동평균선({ma20:,.1f}p) "
             f"{'위에 위치하여 정상 상승 추세 유지 중' if is_bull else '아래에 위치하여 하락 방어막 가동 중'}.\n"
             "- **슬롯별 전략 가이드**: "
-            + ("슬롯 A(수급 스윙) 및 슬롯 B(ETF 그리드) 적극 진입 유효." if is_bull else "슬롯 A/C/D 신규 진입 차단(현금 100% 보존), 슬롯 B 분할 매수만 허용.") + "\n"
-            "- **주요 관제 포인트**: 당일 거래대금 급증 종목에 대한 JEV 1.13 가드레일 모니터링 가동."
+            + ("슬롯 A(수급 스윙) 및 슬롯 B(ETF 그리드) 적극 진입 유효." if is_bull else "슬롯 A/C/D 신규 진입 차단(현금 100% 보존), 슬롯 B(ETF 볼린저 그리드) 분할 매수만 허용.") + "\n"
+            "- **주요 관제 포인트**: 고변동성 장세 속 슬롯 B 분할 매수 및 TypeSafe JEV 1.13 가드레일 모니터링 가동."
         )
         self._save_report(file_path, history_path, briefing)
         return briefing
