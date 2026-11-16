@@ -93,11 +93,9 @@ class SlotBBollingerGrid(BaseStrategy):
         now = datetime.now()
         current_time = now.time()
 
-        # 정규장 시간(09:00 ~ 15:20) 외 장전/장후에는 신규 매수 원천 차단
-        if not self.bypass_time_filter:
-            if current_time < dtime(9, 0) or current_time > dtime(15, 20):
-                if not current_position:
-                    return None
+        # 정규장 시간(09:00 ~ 15:20) 외 장전/장후에는 매수 및 청산 평가 모두 원천 차단 (08:35 프리마켓 왜곡 호가 방지)
+        if not self.bypass_time_filter and (current_time < dtime(9, 0) or current_time > dtime(15, 20)):
+            return None
 
         if tick.ticker not in self.universe:
             return None
@@ -196,14 +194,21 @@ class SlotBBollingerGrid(BaseStrategy):
                         exit_reason="STRATEGY_PARTIAL_TP"
                     )
 
-            # (4) 2차 / 3차 추가 분할 매수 검사
-            current_stage = self.split_stage_tracker.get(tick.ticker, 1)
+            # (4) 2차 / 3차 추가 분할 매수 검사 (오버나잇 보유 시 매수원금 비율로 단계 복원 및 한도 초과 방어)
+            alloc_cap = max(1_000_000.0, self.allocated_capital_per_stock)
+            invested_amount = current_position.quantity * current_position.entry_price
+            if invested_amount >= alloc_cap * 0.85 or has_done_partial_tp:
+                return None
 
-            # 2차 매수: 1차 진입가 대비 -1.5% 추가 하락 시 (30%, 150만 원)
+            if tick.ticker in self.split_stage_tracker:
+                current_stage = self.split_stage_tracker[tick.ticker]
+            else:
+                current_stage = 2 if invested_amount >= alloc_cap * 0.45 else 1
+
+            # 2차 매수: 1차 진입가 대비 -1.5% 추가 하락 시 (배정 자본금의 30%)
             if current_stage == 1 and pnl_rate <= -1.5:
-                qty = int(1_500_000 // ask_price)
+                qty = int((alloc_cap * 0.30) // ask_price)
                 if qty > 0:
-                    self.split_stage_tracker[tick.ticker] = 2
                     return Signal(
                         slot_id=self.slot_id,
                         ticker=tick.ticker,
@@ -216,11 +221,10 @@ class SlotBBollingerGrid(BaseStrategy):
                         stop_loss_price=round(ask_price * 0.965, 2)
                     )
 
-            # 3차 매수: 2차 매수 후 평단가 대비 반등 시 (40%, 200만 원)
+            # 3차 매수: 2차 매수 후 평단가 대비 반등 시 (배정 자본금의 40%)
             elif current_stage == 2 and pnl_rate >= 0.5:
-                qty = int(2_000_000 // ask_price)
+                qty = int((alloc_cap * 0.40) // ask_price)
                 if qty > 0:
-                    self.split_stage_tracker[tick.ticker] = 3
                     return Signal(
                         slot_id=self.slot_id,
                         ticker=tick.ticker,
@@ -237,12 +241,12 @@ class SlotBBollingerGrid(BaseStrategy):
 
         # 2. 미보유 상태 -> 하단선(-2σ) 터치 시 1차 30% 분할 매수
         if self.split_stage_tracker.get(tick.ticker, 0) >= 1:
-            return None  # 이미 당일 1차 매수 주문이 제출되어 체결 대기 중이면 중복 매수 차단
+            return None  # 이미 당일 1차 매수 체결 완료 시 중복 매수 차단
 
         if lower > 0 and ask_price <= lower:
-            qty = int(1_500_000 // ask_price)  # 30% (150만 원)
+            alloc_cap = max(1_000_000.0, self.allocated_capital_per_stock)
+            qty = int((alloc_cap * 0.30) // ask_price)  # 30% (기본 150만 원)
             if qty > 0:
-                self.split_stage_tracker[tick.ticker] = 1
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,

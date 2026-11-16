@@ -22,6 +22,10 @@ class JevCascadeClient:
         self.circuit_broken: bool = False
         self.circuit_broken_at: float = 0.0
 
+    def record_cooldown(self, ticker: str):
+        """종목별 5분 쿨다운 타임스탬프 즉시 기록 (청산 직후 재진입 방지)"""
+        self.cooldown_tracker[ticker] = time.time()
+
     def check_stage1_filter(
         self,
         tick: TickData,
@@ -33,7 +37,7 @@ class JevCascadeClient:
         1단계 로컬 정량 필터 (0.1ms 실행, 95% 노이즈 사전 차단):
         - 목표가 돌파 여부
         - 체결강도 >= 110.0%
-        - 1분 거래량 >= 20분 평균의 250%
+        - 1분 거래량 >= 20분 평균의 180% (고변동성/레버리지 ETF 실전 최적화)
         - 5분 쿨다운 미적용
         """
         now = time.time()
@@ -50,8 +54,8 @@ class JevCascadeClient:
         if tick.exec_strength < 110.0:
             return False, f"EXEC_STRENGTH_LOW_{tick.exec_strength:.1f}%"
 
-        # 4. 거래량 폭발 검사
-        if avg_vol_20m > 0 and vol_1m < (avg_vol_20m * 2.5):
+        # 4. 거래량 폭발 검사 (최근 장세 적응: 1분 거래량이 20분 평균의 180% 이상)
+        if avg_vol_20m > 0 and vol_1m < (avg_vol_20m * 1.8):
             return False, "VOLUME_SURGE_INSUFFICIENT"
 
         return True, "STAGE1_PASSED"
@@ -61,7 +65,7 @@ class JevCascadeClient:
         ticker: str,
         tick: TickData,
         target_price: float,
-        surge_ratio: float = 2.5
+        surge_ratio: float = 1.8
     ) -> Tuple[bool, float, str]:
         """
         2단계 OpenRouter typesafe/jev-1.13 API 호출 (Decisions 엔드포인트):

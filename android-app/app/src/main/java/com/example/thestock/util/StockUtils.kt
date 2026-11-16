@@ -23,6 +23,10 @@ object StockUtils {
         "196170" to "알테오젠",
         "086520" to "에코프로",
         "247540" to "에코프로비엠",
+        "277810" to "두산로보틱스",
+        "041510" to "에스엠",
+        "259960" to "크래프톤",
+        "352820" to "하이브",
         "069500" to "KODEX 200",
         "229200" to "KODEX 코스닥150",
         "122630" to "KODEX 레버리지",
@@ -73,11 +77,18 @@ object StockUtils {
 
     /**
      * ISO 8601 문자열 또는 날짜 문자열을 "MM/dd HH:mm:ss" 형식으로 변환합니다.
+     * UTC 타임존 표기(Z 또는 +00:00)가 있을 경우 기기 로컬 타임존(KST)으로 자동 변환합니다.
      */
     fun formatDateTimeShort(dateTimeStr: String?): String {
         if (dateTimeStr.isNullOrBlank()) return "-"
         return try {
-            val clean = dateTimeStr.replace("T", " ").substringBefore(".")
+            if (dateTimeStr.endsWith("Z") || dateTimeStr.contains("+00:00")) {
+                val instant = java.time.Instant.parse(dateTimeStr)
+                val zdt = instant.atZone(java.time.ZoneId.systemDefault())
+                val formatter = java.time.format.DateTimeFormatter.ofPattern("MM/dd HH:mm:ss")
+                return zdt.format(formatter)
+            }
+            val clean = dateTimeStr.replace("T", " ").substringBefore(".").substringBefore("+").trim()
             if (clean.length >= 16) {
                 // "2026-10-16 07:53:56" -> "10/16 07:53:56"
                 val parts = clean.split(" ")
@@ -98,7 +109,13 @@ object StockUtils {
     fun formatTimeOnly(dateTimeStr: String?): String {
         if (dateTimeStr.isNullOrBlank()) return "-"
         return try {
-            val clean = dateTimeStr.replace("T", " ").substringBefore(".")
+            if (dateTimeStr.endsWith("Z") || dateTimeStr.contains("+00:00")) {
+                val instant = java.time.Instant.parse(dateTimeStr)
+                val zdt = instant.atZone(java.time.ZoneId.systemDefault())
+                val formatter = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")
+                return zdt.format(formatter)
+            }
+            val clean = dateTimeStr.replace("T", " ").substringBefore(".").substringBefore("+").trim()
             if (clean.contains(" ")) {
                 clean.substringAfter(" ")
             } else if (clean.contains(":")) {

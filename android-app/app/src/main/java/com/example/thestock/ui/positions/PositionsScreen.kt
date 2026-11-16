@@ -296,8 +296,8 @@ fun PositionsScreen(
                                             )
                                         }
 
-                                        val isBreakevenLocked = pos.stop_loss_price >= pos.entry_price
-                                        val isTrailingActive = (pos.slot_id == "SLOT_C" && pos.profit_rate >= 1.5) || (pos.slot_id == "SLOT_D" && pos.profit_rate >= 3.5)
+                                        val isBreakevenLocked = pos.stop_loss_price >= pos.entry_price || (pos.slot_id == "SLOT_C" && pos.profit_rate >= 1.2)
+                                        val isTrailingActive = (pos.slot_id == "SLOT_C" && pos.profit_rate >= 2.0) || (pos.slot_id == "SLOT_D" && pos.profit_rate >= 3.5)
                                         if (isBreakevenLocked) {
                                             Spacer(Modifier.width(4.dp))
                                             Surface(
@@ -402,7 +402,7 @@ fun PositionsScreen(
                                     Column(horizontalAlignment = Alignment.End) {
                                         Text("보유", color = TextMuted, fontSize = 9.sp)
                                         Text(
-                                            text = "${pos.holding_days}일차",
+                                            text = if (pos.holding_days <= 0) "당일 진입" else "${pos.holding_days}일차",
                                             color = CyberCyan,
                                             fontSize = 11.sp,
                                             fontWeight = FontWeight.Medium

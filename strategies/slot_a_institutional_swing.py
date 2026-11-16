@@ -26,7 +26,7 @@ class SlotAInstitutionalSwing(BaseStrategy):
         self.target_capital_per_stock: float = 3_300_000.0
         self.take_profit_rate: float = 6.0    # +6.0% 최종 전량 익절
         self.partial_tp_rate: float = 3.0     # +3.0% 도달 시 50% 1차 분할 익절
-        self.stop_loss_rate: float = -3.5     # 초기 손절선 -3.5%
+        self.stop_loss_rate: float = -3.0     # 초기 칼손절선 -3.0% (수수료·세금 포함 -3.3% 이내 방어)
         self.max_holding_days: int = 5
         self.split_buy_tracker: Dict[str, int] = {}
         self.partial_tp_tracker: Dict[str, bool] = {}    # 1차 익절 완료 여부 추적
@@ -99,6 +99,10 @@ class SlotAInstitutionalSwing(BaseStrategy):
     ) -> Optional[Signal]:
         now = datetime.now()
         current_time = now.time()
+
+        # 정규장 시간(09:00 ~ 15:20) 외 장전/장후에는 매수 및 청산 평가 모두 원천 차단 (08:35 프리마켓 왜곡 호가 방지)
+        if not self.bypass_time_filter and (current_time < dtime(9, 0) or current_time > dtime(15, 20)):
+            return None
 
         ask_price = tick.ask_price if tick.ask_price > 0 else tick.price
         bid_price = tick.bid_price if tick.bid_price > 0 else tick.price
@@ -226,15 +230,14 @@ class SlotAInstitutionalSwing(BaseStrategy):
                     exit_reason="TIME_EXIT_1515"
                 )
 
-            # (4) 2차 50% 분할 매수 (D+1 진입 당일 09:15 ~ 10:00)
-            if current_position.holding_days == 0 and dtime(9, 15) <= current_time <= dtime(10, 0):
+            # (4) 2차 50% 분할 매수 (D+1 진입 당일 09:15 ~ 15:20)
+            if current_position.holding_days == 0 and (self.bypass_time_filter or (dtime(9, 15) <= current_time <= dtime(15, 20))):
                 stage = self.split_buy_tracker.get(tick.ticker, 1)
                 # 현재 포지션 가치가 목표금액의 70% 미만일 때(1차 50%만 매수된 상태)
                 if stage < 2 and (current_position.quantity * current_position.entry_price) < (self.target_capital_per_stock * 0.7):
                     half_capital = self.target_capital_per_stock * 0.5
                     qty = int(half_capital // ask_price)
                     if qty > 0:
-                        self.split_buy_tracker[tick.ticker] = 2
                         stop_price = round(ask_price * (1.0 + self.stop_loss_rate / 100.0), 2)
                         take_price = round(ask_price * (1.0 + self.take_profit_rate / 100.0), 2)
                         return Signal(
@@ -252,15 +255,14 @@ class SlotAInstitutionalSwing(BaseStrategy):
 
             return None
 
-        # 2. 미보유 상태인 경우 -> 후보군 대상 분할 매수 검사 (09:00 ~ 10:00 1차 50%)
+        # 2. 미보유 상태인 경우 -> 후보군 대상 분할 매수 검사 (09:00 ~ 15:20 1차 50%)
         if tick.ticker in self.selected_candidates:
             if self.split_buy_tracker.get(tick.ticker, 0) >= 1:
-                return None  # 이미 당일 1차 매수 주문이 제출된 종목은 중복 매수 차단
-            if dtime(9, 0) <= current_time <= dtime(10, 0):
+                return None  # 이미 당일 1차 매수 체결된 종목은 중복 매수 차단
+            if self.bypass_time_filter or (dtime(9, 0) <= current_time <= dtime(15, 20)):
                 half_capital = self.target_capital_per_stock * 0.5  # 약 165만 원
                 qty = int(half_capital // ask_price)
                 if qty > 0:
-                    self.split_buy_tracker[tick.ticker] = 1
                     stop_price = round(ask_price * (1.0 + self.stop_loss_rate / 100.0), 2)
                     take_price = round(ask_price * (1.0 + self.take_profit_rate / 100.0), 2)
                     return Signal(

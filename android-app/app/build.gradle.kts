@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.thestock"
         minSdk = 24
         targetSdk = 36
-        versionCode = 7
-        versionName = "1.0.9"
+        versionCode = 8
+        versionName = "1.1.3"
     }
 
     buildTypes {

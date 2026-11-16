@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Callable, Dict, List, Optional, Set, Tuple
 import httpx
 
@@ -214,7 +214,7 @@ class TossClient:
                         if not sym or price <= 0:
                             continue
                         vol = int(item.get("volume", 1000))
-                        base_open = self._session_open_prices.setdefault(sym, price)
+                        base_open = self._session_open_prices.setdefault(sym, price) if now_dt.time() >= dtime(9, 0) else price
                         chg_pct = ((price - base_open) / base_open) * 100.0 if base_open > 0 else 0.0
                         dyn_strength = round(max(80.0, min(160.0, 112.0 + (chg_pct * 10.0))), 1)
                         result[sym] = TickData(
@@ -237,7 +237,7 @@ class TossClient:
                             price = float(item.get("lastPrice", 0.0))
                             if not sym or price <= 0:
                                 continue
-                            base_open = self._session_open_prices.setdefault(sym, price)
+                            base_open = self._session_open_prices.setdefault(sym, price) if now_dt.time() >= dtime(9, 0) else price
                             chg_pct = ((price - base_open) / base_open) * 100.0 if base_open > 0 else 0.0
                             dyn_strength = round(max(80.0, min(160.0, 112.0 + (chg_pct * 10.0))), 1)
                             result[sym] = TickData(
@@ -274,6 +274,7 @@ class TossClient:
             if res.status_code == 200:
                 book_data = res.json().get("result", {})
                 asks = book_data.get("asks", [])
+                bids = book_data.get("bids", [])
                 ask_price = float(asks[0].get("price", 0.0)) if asks else 0.0
                 bid_price = float(bids[0].get("price", 0.0)) if bids else 0.0
                 return (bid_price, ask_price)

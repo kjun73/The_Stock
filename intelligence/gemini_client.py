@@ -138,6 +138,10 @@ class GeminiAnalyst:
         profit_rate = (total_profit / total_initial) * 100.0 if total_initial > 0 else 0.0
 
         total_closed_pnl = sum(t.get("net_pnl", 0) for t in trades)
+        unrealized_pnl = sum(
+            (float(p.get("current_price", 0.0)) - float(p.get("entry_price", 0.0))) * int(p.get("quantity", 0))
+            for p in positions
+        )
         emergency_trades = [t for t in trades if "EMERGENCY_FLUSH" in str(t.get("exit_reason", ""))]
 
         # 포지션 분석
@@ -173,7 +177,7 @@ class GeminiAnalyst:
 
 #### 1. 포트폴리오 총평
 - **총 자산**: **{total_asset:,.0f}원** (원금 대비 {total_profit:+,.0f}원, **{profit_rate:+.2f}%**)
-- **운용 성과**: 당일 청산 손익 {total_closed_pnl:+,.0f}원 | 미실현 평가손익 {total_profit:+,.0f}원
+- **운용 성과**: 당일 청산 손익 {total_closed_pnl:+,.0f}원 ({len(trades)}건) | 미실현 평가손익 {unrealized_pnl:+,.0f}원
 - **인프라 무결성**: 네트워크 단절 비상탈출(Emergency Flush) {len(emergency_trades)}건 (정상 가동 100%)
 
 #### 2. 슬롯별 보유 포지션 현황

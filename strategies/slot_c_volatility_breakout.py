@@ -12,16 +12,17 @@ logger = logging.getLogger(__name__)
 ETF_UNIVERSE_SET = {"069500", "229200", "122630", "233740", "114800", "252670"}
 
 DEFAULT_MOMENTUM_UNIVERSE = [
-    "233740",  # KODEX 코스닥150레버리지 (거래세 0% 면제, 백테스트 수익팩터 2.03)
+    "233740",  # KODEX 코스닥150레버리지 (거래세 0% 면제, 최고 탄력 ETF)
     "122630",  # KODEX 레버리지 (거래세 0% 면제)
-    "005930",  # 삼성전자
-    "000660",  # SK하이닉스
-    "196170",  # 알테오젠
-    "247540",  # 에코프로비엠
-    "028300",  # HLB
-    "068270",  # 셀트리온
-    "035420",  # NAVER
-    "005380",  # 현대차
+    "252670",  # KODEX 200선물인버스2X (거래세 0% 면제, 헷지/하락 변동성)
+    "196170",  # 알테오젠 (코스닥 시총 1위 바이오 주도주)
+    "247540",  # 에코프로비엠 (2차전지 모멘텀)
+    "086520",  # 에코프로 (2차전지 지주사 탄력주)
+    "028300",  # HLB (코스닥 바이오 모멘텀)
+    "068270",  # 셀트리온 (바이오 대표주)
+    "267260",  # HD현대일렉트릭 (AI 전력인프라 주도주)
+    "277810",  # 두산로보틱스 (로봇 모멘텀)
+    "041510",  # 에스엠 (엔터 모멘텀)
 ]
 
 
@@ -50,12 +51,15 @@ class SlotCVolatilityBreakout(BaseStrategy):
         self.capital_per_stock: float = 2_500_000.0
         self.bypass_time_filter: bool = False
 
-        # 동적 트레일링 스탑 & 손절선 파라미터 (최근 고변동성 장세 최적화)
+        # 동적 트레일링 스탑, 본전 보존 & 칼손절 파라미터 (주간 퀀트 손익비 진단 반영)
         self.high_watermarks: Dict[str, float] = {}     # 진입 후 종목별 최고가 추적
-        self.trailing_active: Dict[str, bool] = {}       # 트레일링 발동 여부 (+1.5% 도달 시 True)
-        self.trailing_activation_rate: float = 1.5      # +1.5% 도달 시 트레일링 활성화
-        self.trailing_drop_rate: float = 1.0            # 최고가 대비 -1.0% 반락 시 익절
-        self.stop_loss_rate: float = -2.8               # 일중 휩소 노이즈 방어를 위해 -2.8%로 유연화
+        self.trailing_active: Dict[str, bool] = {}       # 트레일링 발동 여부 (+2.0% 도달 시 True)
+        self.breakeven_active: Dict[str, bool] = {}      # 본전 보존 발동 여부 (+1.2% 도달 시 True)
+        self.traded_today_tickers: set[str] = set()      # 당일 청산/손절 완료 종목 재진입 원천 차단 (1일 1종목 1회 원칙)
+        self.breakeven_activation_rate: float = 1.2     # +1.2% 도달 시 본전(+0.35%) 보존 스탑 잠금
+        self.trailing_activation_rate: float = 2.0      # +2.0% 도달 시 트레일링 활성화
+        self.trailing_drop_rate: float = 0.8            # 최고가 대비 -0.8% 반락 시 익절 (최소 +1.2% 명목수익 확보)
+        self.stop_loss_rate: float = -1.8               # 돌파 실패 시 -1.8% 칼손절 (손익비 비대칭성 확보)
 
     def update_watchlist(self, top_tickers: List[str], target_prices_map: Dict[str, float], prev_ranges_map: Optional[Dict[str, float]] = None):
         self.universe = top_tickers[:25]
@@ -63,8 +67,15 @@ class SlotCVolatilityBreakout(BaseStrategy):
         if prev_ranges_map:
             self.prev_ranges.update(prev_ranges_map)
 
-    async def run_morning_calibration(self):
-        """08:45 장전 루틴: pykrx로 감시 종목의 전일 변동폭(prev_ranges)과 전일 분당 평균 거래량(avg_volumes) 사전 로드"""
+    async def run_morning_calibration(self, exclude_tickers: Optional[List[str]] = None):
+        """08:45 장전 루틴: 슬롯 A 중복 종목 배제 및 pykrx로 감시 종목의 전일 변동폭(prev_ranges)과 전일 분당 평균 거래량(avg_volumes) 사전 로드"""
+        exclude_set = set(exclude_tickers or [])
+        # 슬롯 A 스윙 종목과 겹치는 종목 자동 배제
+        active_candidates = [t for t in self.universe if t not in exclude_set]
+        if not active_candidates:
+            active_candidates = [t for t in DEFAULT_MOMENTUM_UNIVERSE if t not in exclude_set]
+        self.universe = active_candidates
+
         try:
             from pykrx import stock
             from datetime import timedelta
@@ -81,7 +92,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
                     self.prev_ranges[ticker] = max(1.0, high_p - low_p)
                     # 정규장 390분(09:00~15:30) 분당 평균 거래량 추정
                     self.avg_volumes[ticker] = max(100.0, vol / 390.0)
-            logger.info(f"✅ [{self.name}] 08:45 실증 전일변동폭 및 분당평균거래량 캘리브레이션 완료 ({len(self.prev_ranges)}종목)")
+            logger.info(f"✅ [{self.name}] 08:45 실증 전일변동폭 및 분당평균거래량 캘리브레이션 완료 ({len(self.prev_ranges)}종목, 슬롯A 제외 {len(exclude_set)}개)")
         except Exception as e:
             logger.info(f"[{self.name}] 캘리브레이션 폴백: {e}")
 
@@ -93,6 +104,10 @@ class SlotCVolatilityBreakout(BaseStrategy):
         now = datetime.now()
         current_time = now.time()
 
+        # 정규장 시간(09:00 ~ 15:20) 외 장전/장후에는 매수 및 청산 평가 모두 원천 차단 (08:35 프리마켓 왜곡 호가 방지)
+        if not self.bypass_time_filter and (current_time < dtime(9, 0) or current_time > dtime(15, 20)):
+            return None
+
         ask_price = tick.ask_price if tick.ask_price > 0 else tick.price
         bid_price = tick.bid_price if tick.bid_price > 0 else tick.price
         if ask_price <= 0 or bid_price <= 0:
@@ -100,7 +115,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
 
         asset_type = "ETF" if tick.ticker in ETF_UNIVERSE_SET else "STOCK"
 
-        # 1. 포지션 보유 중인 경우 -> 청산(15:15 타임아웃, 트레일링 익절, 절대 손절) 검사
+        # 1. 포지션 보유 중인 경우 -> 청산(15:15 타임아웃, 트레일링 익절, 본전 보존, 칼손절) 검사
         if current_position:
             pnl_rate = ((bid_price - current_position.entry_price) / current_position.entry_price) * 100.0
 
@@ -108,6 +123,9 @@ class SlotCVolatilityBreakout(BaseStrategy):
             if not self.bypass_time_filter and current_time >= dtime(15, 15):
                 self.high_watermarks.pop(tick.ticker, None)
                 self.trailing_active.pop(tick.ticker, None)
+                self.breakeven_active.pop(tick.ticker, None)
+                self.traded_today_tickers.add(tick.ticker)
+                self.jev_client.record_cooldown(tick.ticker)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
@@ -129,16 +147,23 @@ class SlotCVolatilityBreakout(BaseStrategy):
 
             high_price = self.high_watermarks[tick.ticker]
 
-            # 트레일링 모드 활성화 검사 (+1.5% 도달 시)
+            # 본전 보존 모드 활성화 검사 (+1.2% 도달 시)
+            if pnl_rate >= self.breakeven_activation_rate:
+                self.breakeven_active[tick.ticker] = True
+
+            # 트레일링 모드 활성화 검사 (+2.0% 도달 시)
             if pnl_rate >= self.trailing_activation_rate:
                 self.trailing_active[tick.ticker] = True
 
-            # (2) 동적 트레일링 익절: 트레일링 활성화 상태에서 최고가 대비 1.0% 이상 반락 시 이익 확정
+            # (2) 동적 트레일링 익절: 트레일링 활성화 상태에서 최고가 대비 0.8% 이상 반락 시 이익 확정
             if self.trailing_active.get(tick.ticker, False):
                 drop_from_high = ((high_price - bid_price) / high_price) * 100.0
                 if drop_from_high >= self.trailing_drop_rate:
                     self.high_watermarks.pop(tick.ticker, None)
                     self.trailing_active.pop(tick.ticker, None)
+                    self.breakeven_active.pop(tick.ticker, None)
+                    self.traded_today_tickers.add(tick.ticker)
+                    self.jev_client.record_cooldown(tick.ticker)
                     return Signal(
                         slot_id=self.slot_id,
                         ticker=tick.ticker,
@@ -151,10 +176,32 @@ class SlotCVolatilityBreakout(BaseStrategy):
                         exit_reason="STRATEGY_TRAILING_STOP"
                     )
 
-            # (3) 하방 절대 손절 (-2.8%)
+            # (3) 본전 보존 스탑: +1.2% 이상 수익 진입 후 +0.35% 이하로 밀릴 시 수수료 보전 탈출
+            if self.breakeven_active.get(tick.ticker, False) and pnl_rate <= 0.35:
+                self.high_watermarks.pop(tick.ticker, None)
+                self.trailing_active.pop(tick.ticker, None)
+                self.breakeven_active.pop(tick.ticker, None)
+                self.traded_today_tickers.add(tick.ticker)
+                self.jev_client.record_cooldown(tick.ticker)
+                return Signal(
+                    slot_id=self.slot_id,
+                    ticker=tick.ticker,
+                    asset_type=current_position.asset_type,
+                    action="SELL",
+                    order_type="MARKET_BREAKOUT",
+                    price=bid_price,
+                    quantity=current_position.quantity,
+                    reason=f"단타 수익 후 실질 본전(+0.35%) 보존 스탑 ({pnl_rate:.2f}%)",
+                    exit_reason="STRATEGY_BREAKEVEN_STOP"
+                )
+
+            # (4) 하방 칼손절 (-1.8%)
             if pnl_rate <= self.stop_loss_rate:
                 self.high_watermarks.pop(tick.ticker, None)
                 self.trailing_active.pop(tick.ticker, None)
+                self.breakeven_active.pop(tick.ticker, None)
+                self.traded_today_tickers.add(tick.ticker)
+                self.jev_client.record_cooldown(tick.ticker)
                 return Signal(
                     slot_id=self.slot_id,
                     ticker=tick.ticker,
@@ -169,7 +216,10 @@ class SlotCVolatilityBreakout(BaseStrategy):
 
             return None
 
-        # 2. 미보유 상태 -> 목표가 돌파 및 2단계 JEV 캐스케이드 검사
+        # 2. 미보유 상태 -> 당일 이미 매매 완료된 종목은 고점 재진입 원천 차단 (1일 1종목 1회 원칙)
+        if tick.ticker in self.traded_today_tickers:
+            return None
+
         # 14:30 이후에는 신규 단타 진입 금지 (테스트/시뮬레이션 시 우회 허용)
         if not self.bypass_time_filter and (current_time >= dtime(14, 30) or current_time < dtime(9, 5)):
             return None
@@ -188,7 +238,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
         avg_vol = self.avg_volumes.get(tick.ticker, 1000.0)
         vol_1m = self.recent_1m_volumes.get(
             tick.ticker,
-            float(tick.volume) if tick.volume > 0 else (avg_vol * 2.5)
+            float(tick.volume) if tick.volume > 0 else (avg_vol * 1.8)
         )
 
         # 1단계: 로컬 정량 필터 (0.1ms, $0)
@@ -213,6 +263,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
         if is_approved:
             qty = int(self.capital_per_stock // ask_price)
             if qty > 0:
+                self.jev_client.record_cooldown(tick.ticker)
                 logger.info(f"⚡ [슬롯 C 진입 승인] {tick.ticker} ({asset_type}, 가짜돌파확률: {fakeout_prob:.2f}) -> {qty}주 매수")
                 return Signal(
                     slot_id=self.slot_id,
@@ -223,7 +274,7 @@ class SlotCVolatilityBreakout(BaseStrategy):
                     price=ask_price,
                     quantity=qty,
                     reason=f"변동성 돌파 및 JEV 승인 ({reason2})",
-                    stop_loss_price=round(ask_price * 0.972, 2),
+                    stop_loss_price=round(ask_price * (1.0 + self.stop_loss_rate / 100.0), 2),
                     take_profit_price=None
                 )
 
@@ -234,4 +285,6 @@ class SlotCVolatilityBreakout(BaseStrategy):
         self.open_prices.clear()
         self.high_watermarks.clear()
         self.trailing_active.clear()
+        self.breakeven_active.clear()
+        self.traded_today_tickers.clear()
         self.recent_1m_volumes.clear()

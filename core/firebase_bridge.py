@@ -358,10 +358,10 @@ class FirebaseBridge:
 
     def sync_app_version(
         self,
-        version_code: int = 7,
-        version_name: str = "1.0.9",
-        apk_url: str = "https://github.com/kjun73/The_Stock/releases/download/v1.0.9/app-debug.apk",
-        notes: str = "v1.0.9 KRX 공식 연동, 14일 자산 곡선(Equity Curve), 본전/트레일링 배지, 청산 손익비 요약 및 날짜별 복기 뷰어 탑재",
+        version_code: int = 8,
+        version_name: str = "1.1.3",
+        apk_url: str = "https://github.com/kjun73/The_Stock/releases/download/v1.1.3/app-debug.apk",
+        notes: str = "v1.1.3 주간 퀀트 복기 반영(슬롯 C 당일 재진입 차단·본전스탑·손익비 개선), 08:35 장전 청산 방어, KST 시각 보정 및 신규 주도주 종목명 탑재",
         is_force: bool = False
     ):
         """안드로이드 인앱 자동 업데이트 메타데이터 동기화"""

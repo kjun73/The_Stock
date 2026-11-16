@@ -81,7 +81,7 @@ class SqliteLedger:
                     stop_loss_price REAL NOT NULL,
                     take_profit_price REAL,
                     profit_rate REAL DEFAULT 0.0,
-                    entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    entry_time TIMESTAMP DEFAULT (datetime('now', 'localtime')),
                     holding_days INTEGER DEFAULT 0,
                     PRIMARY KEY (slot_id, ticker)
                 );
@@ -102,7 +102,7 @@ class SqliteLedger:
                     net_pnl REAL NOT NULL,
                     profit_rate REAL NOT NULL,
                     entry_time TIMESTAMP NOT NULL,
-                    exit_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    exit_time TIMESTAMP DEFAULT (datetime('now', 'localtime')),
                     exit_reason TEXT NOT NULL
                 );
             """)
@@ -293,11 +293,13 @@ class SqliteLedger:
             new_cash = row[0] - total_required_cash
             stop_loss = signal.stop_loss_price or round(exec_price * 0.965, 2)
 
-            # 포지션 삽입/갱신 (분할 매수 시 수량 누적, 평단가 및 손절/익절가 비례 재계산)
+            now_dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 포지션 삽입/갱신 (분할 매수 시 수량 누적, 평단가 및 손절/익절가 비례 재계산, KST 로컬 시각 영구 기록)
             await db.execute("""
                 INSERT INTO slot_positions 
-                (slot_id, ticker, name, asset_type, quantity, entry_price, current_price, stop_loss_price, take_profit_price, profit_rate)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0)
+                (slot_id, ticker, name, asset_type, quantity, entry_price, current_price, stop_loss_price, take_profit_price, profit_rate, entry_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?)
                 ON CONFLICT(slot_id, ticker) DO UPDATE SET
                     entry_price = (entry_price * quantity + excluded.entry_price * excluded.quantity) / (quantity + excluded.quantity),
                     quantity = quantity + excluded.quantity,
@@ -322,7 +324,8 @@ class SqliteLedger:
                 exec_price,
                 exec_price,
                 stop_loss,
-                signal.take_profit_price
+                signal.take_profit_price,
+                now_dt_str
             ))
 
             # 계좌 잔고 갱신
@@ -432,11 +435,12 @@ class SqliteLedger:
             """, (settled_cash, net_pnl, slot_id))
 
             pos_name = pos["name"] if "name" in pos.keys() and pos["name"] else STOCK_NAME_MAP.get(ticker, "")
-            # 거래 기록 저장
+            now_dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 거래 기록 저장 (KST 로컬 청산 시각 명시)
             c_ins = await db.execute("""
                 INSERT INTO trade_records 
-                (slot_id, ticker, name, asset_type, quantity, buy_price, sell_price, gross_pnl, total_cost, net_pnl, profit_rate, entry_time, exit_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (slot_id, ticker, name, asset_type, quantity, buy_price, sell_price, gross_pnl, total_cost, net_pnl, profit_rate, entry_time, exit_time, exit_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 slot_id,
                 ticker,
@@ -450,6 +454,7 @@ class SqliteLedger:
                 net_pnl,
                 profit_rate,
                 pos["entry_time"],
+                now_dt_str,
                 exit_reason
             ))
             trade_id = c_ins.lastrowid
@@ -683,16 +688,17 @@ class SqliteLedger:
         """일일 장마감 결산 스냅샷 및 AI 복기 결과를 SQLite 원장에 영구 기록 (UPSERT)"""
         async with self.lock:
             db = await self.get_connection()
+            now_dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             await db.execute("""
                 INSERT OR REPLACE INTO daily_settlements (
                     date, total_asset, cash_balance, stock_value,
                     total_profit, profit_rate, realized_pnl, unrealized_pnl,
                     trade_count, review_markdown, screening_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 date, total_asset, cash_balance, stock_value,
                 total_profit, profit_rate, realized_pnl, unrealized_pnl,
-                trade_count, review_markdown, screening_json
+                trade_count, review_markdown, screening_json, now_dt_str
             ))
             await db.commit()
 

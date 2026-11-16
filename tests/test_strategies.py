@@ -56,8 +56,9 @@ def test_market_filter_rules():
 
 @pytest.mark.asyncio
 async def test_slot_a_tp_and_sl():
-    """슬롯 A: 1차 분할익절(+3.0%), 본전보존(0.0%), 최종익절(+6.0%), 초기손절(-3.5%) 검증"""
+    """슬롯 A: 1차 분할익절(+3.0%), 본전보존(0.0%), 최종익절(+6.0%), 초기손절(-3.0%) 검증"""
     slot_a = SlotAInstitutionalSwing()
+    slot_a.bypass_time_filter = True
 
     # 보유 포지션 설정 (진입가 100,000원, 30주)
     pos = SlotPosition(
@@ -67,7 +68,7 @@ async def test_slot_a_tp_and_sl():
         quantity=30,
         entry_price=100_000.0,
         current_price=100_000.0,
-        stop_loss_price=96_500.0,  # -3.5%
+        stop_loss_price=97_000.0,  # -3.0%
         take_profit_price=106_000.0  # +6.0%
     )
 
@@ -101,6 +102,7 @@ async def test_slot_a_tp_and_sl():
 
     # 3. 1차 분할 익절 후 지수 반락으로 본전(100,000원 이하) 이탈 시 본전 보존 손절 검증
     slot_a_be = SlotAInstitutionalSwing()
+    slot_a_be.bypass_time_filter = True
     slot_a_be.partial_tp_tracker["005930"] = True
     slot_a_be.breakeven_tracker["005930"] = True
     tick_be = TickData(ticker="005930", price=99_800.0, bid_price=99_800.0, ask_price=99_900.0)
@@ -108,8 +110,9 @@ async def test_slot_a_tp_and_sl():
     assert sig_be is not None
     assert sig_be.exit_reason == "STRATEGY_BREAKEVEN_STOP"
 
-    # 4. 1차 익절 전 초기 손절 (-3.5% 이하 이탈)
+    # 4. 1차 익절 전 초기 손절 (-3.0% 이하 이탈)
     slot_a_sl = SlotAInstitutionalSwing()
+    slot_a_sl.bypass_time_filter = True
     tick_sl = TickData(ticker="005930", price=96_400.0, bid_price=96_400.0, ask_price=96_500.0)
     sig_sl = await slot_a_sl.evaluate_market(tick_sl, pos)
     assert sig_sl is not None
@@ -372,6 +375,7 @@ def test_slot_b_and_d_dynamic_attributes():
 async def test_slot_a_overnight_breakeven_restore():
     """슬롯 A: 오버나잇 재기동 시 DB stop_loss_price >= entry_price이면 중복 1차익절 방지 및 본전보존 손절 작동 검증"""
     slot_a = SlotAInstitutionalSwing()
+    slot_a.bypass_time_filter = True
     pos_overnight = SlotPosition(
         slot_id="SLOT_A",
         ticker="005930",
@@ -399,20 +403,20 @@ async def test_slot_a_overnight_breakeven_restore():
 
 @pytest.mark.asyncio
 async def test_slot_c_volume_filter_blocks_low_volume():
-    """슬롯 C: 시초가 거래량 1000 틱 이후 돌파 틱 거래량이 1200(1.2배 < 2.5배)일 때 가짜 돌파로 차단 검증"""
+    """슬롯 C: 시초가 거래량 1000 틱 이후 돌파 틱 거래량이 1200(1.2배 < 1.8배)일 때 가짜 돌파로 차단 검증"""
     from intelligence.jev_client import JevCascadeClient
     jev = JevCascadeClient()
     slot_c = SlotCVolatilityBreakout(jev_client=jev)
     slot_c.bypass_time_filter = True
 
-    # 1. 시초 틱: 200,000원, 거래량 1000 (avg_vol = 1000 등록)
-    tick_open = TickData(ticker="005930", price=200000.0, ask_price=200200.0, bid_price=199800.0, volume=1000)
+    # 1. 시초 틱: 20,000원, 거래량 1000 (avg_vol = 1000 등록)
+    tick_open = TickData(ticker="233740", price=20000.0, ask_price=20020.0, bid_price=19980.0, volume=1000)
     await slot_c.evaluate_market(tick_open, None)
 
-    # 2. 목표가 돌파(203,000원)했으나 거래량이 1200으로 2.5배 미달인 틱
-    tick_fake = TickData(ticker="005930", price=203000.0, ask_price=203200.0, bid_price=202800.0, volume=1200, exec_strength=125.0)
+    # 2. 목표가 돌파(20,300원)했으나 거래량이 1200으로 1.8배 미달인 틱 -> 차단
+    tick_fake = TickData(ticker="233740", price=20300.0, ask_price=20320.0, bid_price=20280.0, volume=1200, exec_strength=125.0)
     sig = await slot_c.evaluate_market(tick_fake, None)
-    assert sig is None, "거래량 폭발(250%) 미달 시 돌파 신호가 차단되어야 함"
+    assert sig is None, "거래량 폭발(180%) 미달 시 돌파 신호가 차단되어야 함"
 
 
 @pytest.mark.asyncio
@@ -536,5 +540,196 @@ async def test_slot_d_same_day_reentry_block_after_stop_loss():
 
 
 
+
+
+
+
+@pytest.mark.asyncio
+async def test_slot_a_tracker_not_locked_on_filter_rejection():
+    """슬롯 A: 마켓필터 진입 차단 시 split_buy_tracker가 오염되지 않아 추후 랠리 시 정상 매수 가능한지 검증"""
+    slot_a = SlotAInstitutionalSwing()
+    slot_a.bypass_time_filter = True
+    slot_a.selected_candidates = ["005930"]
+
+    tick = TickData(ticker="005930", price=210000.0, ask_price=210500.0, bid_price=209500.0)
+
+    # 1. 09:00:00 시점 시그널 생성 (평가만으로는 트래커가 잠기지 않아야 함)
+    sig1 = await slot_a.evaluate_market(tick, None)
+    assert sig1 is not None
+    assert sig1.action == "BUY"
+    assert sig1.order_type == "SPLIT_BUY_1"
+    assert slot_a.split_buy_tracker.get("005930", 0) == 0, "체결 전에는 트래커가 잠겨선 안 됨"
+
+    # 2. 마켓필터가 거부하여 원장 미체결 상태 -> 다음 틱 유입 시에도 여전히 매수 시그널 유효
+    sig2 = await slot_a.evaluate_market(tick, None)
+    assert sig2 is not None
+    assert sig2.action == "BUY"
+
+    # 3. 오케스트레이터에서 체결 성공 시에만 트래커 등록
+    slot_a.split_buy_tracker["005930"] = 1
+
+    # 4. 트래커 등록 후에는 중복 1차 매수 차단
+    sig3 = await slot_a.evaluate_market(tick, None)
+    assert sig3 is None, "체결 완료 후에는 1차 매수 중복 제출이 차단되어야 함"
+
+
+@pytest.mark.asyncio
+async def test_slot_c_volume_filter_allows_180pct_surge():
+    """슬롯 C: 1분 거래량이 20분 평균의 1.8배(180%) 이상이고 체결강도 110% 이상 시 돌파 매수 신호 승인 검증"""
+    from intelligence.jev_client import JevCascadeClient
+    jev = JevCascadeClient()
+    slot_c = SlotCVolatilityBreakout(jev_client=jev)
+    slot_c.bypass_time_filter = True
+
+    # 1. 시초 틱: 20,000원, 거래량 1000 (avg_vol = 1000 등록, target = 20000 + 0.5 * 400 = 20200원)
+    slot_c.prev_ranges["233740"] = 400.0
+    tick_open = TickData(ticker="233740", price=20000.0, ask_price=20020.0, bid_price=19980.0, volume=1000)
+    await slot_c.evaluate_market(tick_open, None)
+
+    # 2. 돌파 틱: 목표가 20,200원을 넘는 20,250원, 거래량 1900 (1.9배 >= 1.8배), 체결강도 125%
+    tick_breakout = TickData(
+        ticker="233740",
+        price=20250.0,
+        ask_price=20260.0,
+        bid_price=20240.0,
+        volume=1900,
+        exec_strength=125.0
+    )
+    sig = await slot_c.evaluate_market(tick_breakout, None)
+    assert sig is not None, "1.8배(180%) 이상 거래량 동반 돌파 시 매수 신호가 발생해야 함"
+    assert sig.action == "BUY"
+    assert sig.ticker == "233740"
+    assert sig.asset_type == "ETF"
+
+
+@pytest.mark.asyncio
+async def test_slot_c_universe_excludes_large_caps_and_slot_a():
+    """슬롯 C: 대형주가 기본 유니버스에서 제거되고 슬롯 A 선정 종목이 캘리브레이션 시 자동 배제되는지 검증"""
+    from intelligence.jev_client import JevCascadeClient
+    from strategies.slot_c_volatility_breakout import DEFAULT_MOMENTUM_UNIVERSE
+    jev = JevCascadeClient()
+    slot_c = SlotCVolatilityBreakout(jev_client=jev)
+
+    # 대형주 4종목이 기본 유니버스에 없어야 함
+    for ticker in ["005930", "000660", "005380", "035420"]:
+        assert ticker not in DEFAULT_MOMENTUM_UNIVERSE, f"{ticker} 대형주는 슬롯 C 기본 유니버스에서 제외되어야 함"
+        assert ticker not in slot_c.universe, f"{ticker} 대형주는 슬롯 C 유니버스에 없어야 함"
+
+    # 고탄력 ETF 포함 확인
+    assert "233740" in slot_c.universe
+    assert "122630" in slot_c.universe
+
+    # 슬롯 A 선정 종목 전달 시 유니버스에서 제외 확인
+    await slot_c.run_morning_calibration(exclude_tickers=["233740", "196170"])
+    assert "233740" not in slot_c.universe
+    assert "196170" not in slot_c.universe
+    assert "122630" in slot_c.universe
+
+
+@pytest.mark.asyncio
+async def test_slot_c_same_day_reentry_blocked_and_breakeven():
+    """슬롯 C: 당일 청산(익절/본전스탑/손절) 완료 종목의 2초 후 상투 재진입(Churning) 원천 차단 및 +1.2% 본전스탑 검증"""
+    from intelligence.jev_client import JevCascadeClient
+    jev = JevCascadeClient()
+    slot_c = SlotCVolatilityBreakout(jev_client=jev)
+    slot_c.bypass_time_filter = True
+
+    # 1. 시초가 등록 (300,000원)
+    slot_c.prev_ranges["277810"] = 4000.0
+    tick_open = TickData(ticker="277810", price=300000.0, ask_price=300200.0, bid_price=299800.0, volume=1000)
+    await slot_c.evaluate_market(tick_open, None)
+
+    pos = SlotPosition(
+        slot_id="SLOT_C",
+        ticker="277810",
+        asset_type="STOCK",
+        quantity=2,
+        entry_price=302_500.0,
+        current_price=302_500.0,
+        stop_loss_price=297_055.0
+    )
+
+    # 2. +1.3% 수익(306,450원) 진입 -> breakeven_active 활성화
+    tick_up = TickData(ticker="277810", price=306450.0, bid_price=306450.0, ask_price=306600.0, volume=2000, exec_strength=120.0)
+    sig_hold = await slot_c.evaluate_market(tick_up, pos)
+    assert sig_hold is None
+    assert slot_c.breakeven_active["277810"] is True
+
+    # 3. +0.3% 이하(303,400원, +0.30%)로 반락 -> STRATEGY_BREAKEVEN_STOP 청산 발동 및 traded_today_tickers 등록
+    tick_be = TickData(ticker="277810", price=303400.0, bid_price=303400.0, ask_price=303500.0, volume=2000, exec_strength=125.0)
+    sig_exit = await slot_c.evaluate_market(tick_be, pos)
+    assert sig_exit is not None
+    assert sig_exit.action == "SELL"
+    assert sig_exit.exit_reason == "STRATEGY_BREAKEVEN_STOP"
+    assert "277810" in slot_c.traded_today_tickers
+
+    # 4. 청산 2초 후 여전히 돌파 목표가(302,000원) 위인 305,000원 강세 틱이 유입되어도 당일 재진입 100% 차단!
+    tick_reentry = TickData(ticker="277810", price=305000.0, ask_price=305200.0, bid_price=304800.0, volume=5000, exec_strength=135.0)
+    sig_reentry = await slot_c.evaluate_market(tick_reentry, None)
+    assert sig_reentry is None, "당일 이미 매매 완료된 종목은 고점 재진입이 원천 차단되어야 함"
+
+    # 5. 익일 08:45 리셋 후에는 정상 진입 가능
+    slot_c.reset_daily_state()
+    assert "277810" not in slot_c.traded_today_tickers
+
+
+@pytest.mark.asyncio
+async def test_pre_market_sell_blocked_all_slots():
+    """전 슬롯(A/B/C/D): 08:35 장전 프리마켓 시간대에는 보유 포지션이 있어도 왜곡 호가 청산(SELL)이 차단되는지 검증"""
+    from unittest.mock import patch
+    from intelligence.jev_client import JevCascadeClient
+
+    mock_premarket = datetime(2026, 11, 16, 8, 35, 13)
+    pos_a = SlotPosition(slot_id="SLOT_A", ticker="005930", asset_type="STOCK", quantity=10, entry_price=200000.0, current_price=190000.0, stop_loss_price=194000.0)
+    pos_b = SlotPosition(slot_id="SLOT_B", ticker="229200", asset_type="ETF", quantity=100, entry_price=10000.0, current_price=9500.0, stop_loss_price=9650.0)
+    pos_c = SlotPosition(slot_id="SLOT_C", ticker="233740", asset_type="ETF", quantity=50, entry_price=10000.0, current_price=9500.0, stop_loss_price=9820.0)
+    pos_d = SlotPosition(slot_id="SLOT_D", ticker="035420", asset_type="STOCK", quantity=10, entry_price=180000.0, current_price=170000.0, stop_loss_price=175500.0)
+
+    with patch("strategies.slot_a_institutional_swing.datetime") as dt_a, \
+         patch("strategies.slot_b_bollinger_grid.datetime") as dt_b, \
+         patch("strategies.slot_c_volatility_breakout.datetime") as dt_c, \
+         patch("strategies.slot_d_retest_swing.datetime") as dt_d:
+        dt_a.now.return_value = mock_premarket
+        dt_b.now.return_value = mock_premarket
+        dt_c.now.return_value = mock_premarket
+        dt_d.now.return_value = mock_premarket
+
+        slot_a = SlotAInstitutionalSwing()
+        slot_b = SlotBBollingerGrid()
+        slot_c = SlotCVolatilityBreakout(jev_client=JevCascadeClient())
+        slot_d = SlotDRetestSwing()
+
+        assert await slot_a.evaluate_market(TickData(ticker="005930", price=190000.0, bid_price=190000.0, ask_price=190500.0), pos_a) is None
+        assert await slot_b.evaluate_market(TickData(ticker="229200", price=9500.0, bid_price=9500.0, ask_price=9510.0), pos_b) is None
+        assert await slot_c.evaluate_market(TickData(ticker="233740", price=9500.0, bid_price=9500.0, ask_price=9510.0), pos_c) is None
+        assert await slot_d.evaluate_market(TickData(ticker="035420", price=170000.0, bid_price=170000.0, ask_price=170500.0), pos_d) is None
+
+
+@pytest.mark.asyncio
+async def test_slot_b_overnight_stage_cap_protection():
+    """슬롯 B: 오버나잇 보유 포지션이 이미 종목당 한도(500만 원)의 85% 이상 매수된 경우 reset_daily_state 이후에도 추가 분할매수 차단 검증"""
+    slot_b = SlotBBollingerGrid()
+    slot_b.bypass_time_filter = True
+    slot_b.allocated_capital_per_stock = 5_000_000.0
+    slot_b.update_bands("229200", upper=11500.0, middle=11000.0, lower=10500.0)
+
+    # 이미 477주(@10,446원 = 약 498만 원, 99.6% 소진) 보유 중인 오버나잇 포지션
+    pos_full = SlotPosition(
+        slot_id="SLOT_B",
+        ticker="229200",
+        asset_type="ETF",
+        quantity=477,
+        entry_price=10446.0,
+        current_price=10250.0,
+        stop_loss_price=10080.0
+    )
+
+    # 익일 08:45 일일 리셋으로 split_stage_tracker가 초기화된 상황
+    slot_b.reset_daily_state()
+
+    # 평단가 대비 -1.88% 하락(10,250원) 틱 유입 시에도 이미 한도 소진 상태이므로 SPLIT_BUY_2가 발동되지 않아야 함
+    tick_dip = TickData(ticker="229200", price=10250.0, bid_price=10245.0, ask_price=10250.0)
+    sig = await slot_b.evaluate_market(tick_dip, pos_full)
+    assert sig is None, "종목당 배정 자본금(500만 원)을 이미 채운 오버나잇 포지션은 추가 분할매수가 차단되어야 함"
 
 

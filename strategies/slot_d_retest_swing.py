@@ -27,7 +27,7 @@ class SlotDRetestSwing(BaseStrategy):
         self.capital_per_stock: float = 3_300_000.0
         self.support_levels: Dict[str, float] = {}  # 종목별 전고점 지지선 가격 (실시간 시세 기반 동적 자동 캘리브레이션)
         self.take_profit_rate: float = 8.0          # +8.0% 목표 익절
-        self.stop_loss_rate: float = -3.0           # -3.0% 초기 손절
+        self.stop_loss_rate: float = -2.5           # -2.5% 초기 칼손절 (수수료·세금 포함 -2.8% 이내 방어)
         self.max_holding_days: int = 7
         self.bypass_time_filter: bool = False
 
@@ -106,11 +106,9 @@ class SlotDRetestSwing(BaseStrategy):
         now = datetime.now()
         current_time = now.time()
 
-        # 정규장 시간(09:00 ~ 15:20) 외 장전/장후에는 신규 매수 원천 차단
-        if not self.bypass_time_filter:
-            if current_time < dtime(9, 0) or current_time > dtime(15, 20):
-                if not current_position:
-                    return None
+        # 정규장 시간(09:00 ~ 15:20) 외 장전/장후에는 매수 및 청산 평가 모두 원천 차단 (08:35 프리마켓 왜곡 호가 방지)
+        if not self.bypass_time_filter and (current_time < dtime(9, 0) or current_time > dtime(15, 20)):
+            return None
 
         ask_price = tick.ask_price if tick.ask_price > 0 else tick.price
         bid_price = tick.bid_price if tick.bid_price > 0 else tick.price

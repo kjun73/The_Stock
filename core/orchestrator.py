@@ -115,12 +115,13 @@ class TradingOrchestrator:
                     if hasattr(strat, "reset_daily_state"):
                         strat.reset_daily_state()
 
-                slot_c = self.strategies.get("SLOT_C")
-                if isinstance(slot_c, SlotCVolatilityBreakout):
-                    await slot_c.run_morning_calibration()
-
                 slot_a = self.strategies.get("SLOT_A")
                 slot_a_cands = getattr(slot_a, "selected_candidates", []) if slot_a else []
+
+                slot_c = self.strategies.get("SLOT_C")
+                if isinstance(slot_c, SlotCVolatilityBreakout):
+                    await slot_c.run_morning_calibration(exclude_tickers=slot_a_cands)
+
                 slot_d = self.strategies.get("SLOT_D")
                 if isinstance(slot_d, SlotDRetestSwing):
                     await slot_d.run_morning_screening(exclude_tickers=slot_a_cands)
@@ -155,7 +156,12 @@ class TradingOrchestrator:
 
             accounts = await self.ledger.get_accounts()
             positions = await self.ledger.get_positions()
-            trades = await self.ledger.get_recent_trades(limit=20)
+            all_trades = await self.ledger.get_recent_trades(limit=50)
+            today_trades = [
+                t for t in all_trades
+                if (isinstance(t.exit_time, datetime) and t.exit_time.strftime("%Y-%m-%d") == today_str) or
+                   (isinstance(t.exit_time, str) and t.exit_time.startswith(today_str))
+            ]
 
             slot_d = self.strategies.get("SLOT_D")
             screening = {
@@ -167,7 +173,7 @@ class TradingOrchestrator:
             try:
                 self.latest_daily_review = await self.gemini_analyst.generate_daily_review(
                     accounts=[a.model_dump() for a in accounts],
-                    trades=[t.model_dump() for t in trades],
+                    trades=[t.model_dump() for t in today_trades],
                     positions=[p.model_dump() for p in positions],
                     screening_candidates=screening,
                     force_regenerate=True
@@ -396,25 +402,8 @@ class TradingOrchestrator:
                     logger.info(f"🚫 [진입 차단] 마켓필터 하락장 방어막에 의해 {signal.slot_id} {signal.ticker} 매수 보류")
                     return
 
-                # 2. 전체 계좌 기준 특정 종목 노출도 가드 (최대 35% 자금 상한선 적용)
+                # 2. 슬롯별 보유 종목 수 상한 확인 (슬롯 A: 최대 3종목, 슬롯 C: 최대 4종목, 슬롯 D: 최대 3종목)
                 all_positions = await self.get_cached_positions()
-                accounts = await self.ledger.get_accounts()
-                total_account_asset = sum(acc.total_asset for acc in accounts)
-                if total_account_asset > 0:
-                    current_stock_value = sum(
-                        (p.current_price or p.entry_price) * p.quantity
-                        for p in all_positions if p.ticker == signal.ticker
-                    )
-                    new_order_value = signal.price * signal.quantity
-                    projected_ratio = (current_stock_value + new_order_value) / total_account_asset
-                    if projected_ratio > 0.35:
-                        logger.warning(
-                            f"🚫 [노출도 제한 차단] {signal.ticker} 매수 시 전체 자산 대비 비중 {projected_ratio*100:.1f}%로 "
-                            f"단일 종목 최대 한도(35%) 초과 -> 신규 매수 기각"
-                        )
-                        return
-
-                # 3. 슬롯별 보유 종목 수 상한 확인 (슬롯 A: 최대 3종목, 슬롯 C: 최대 4종목 등)
                 slot_positions = [p for p in all_positions if p.slot_id == signal.slot_id]
                 if signal.slot_id == "SLOT_A" and len(slot_positions) >= 3:
                     if not any(p.ticker == signal.ticker for p in slot_positions):
@@ -435,6 +424,22 @@ class TradingOrchestrator:
                         f"🛒 [매수 체결] {signal.slot_id} {signal.ticker} {signal.quantity}주 @ {new_pos.entry_price:,.0f}원 "
                         f"({signal.order_type})"
                     )
+                    # 분할 매수 단계 추적기 안전 동기화 (원장 체결 성공 시에만 확정)
+                    strat = self.strategies.get(signal.slot_id)
+                    if strat:
+                        if hasattr(strat, "split_buy_tracker"):
+                            if signal.order_type == "SPLIT_BUY_1":
+                                strat.split_buy_tracker[signal.ticker] = 1
+                            elif signal.order_type == "SPLIT_BUY_2":
+                                strat.split_buy_tracker[signal.ticker] = 2
+                        elif hasattr(strat, "split_stage_tracker"):
+                            if signal.order_type == "SPLIT_BUY_1":
+                                strat.split_stage_tracker[signal.ticker] = 1
+                            elif signal.order_type == "SPLIT_BUY_2":
+                                strat.split_stage_tracker[signal.ticker] = 2
+                            elif signal.order_type == "SPLIT_BUY_3":
+                                strat.split_stage_tracker[signal.ticker] = 3
+
                     self.invalidate_positions_cache()
                     # 보유종목 웹소켓 쿼터 우선 승격
                     all_positions_updated = await self.get_cached_positions()
@@ -550,12 +555,13 @@ class TradingOrchestrator:
                         if hasattr(strat, "reset_daily_state"):
                             strat.reset_daily_state()
 
-                    slot_c = self.strategies.get("SLOT_C")
-                    if isinstance(slot_c, SlotCVolatilityBreakout):
-                        await slot_c.run_morning_calibration()
-
                     slot_a = self.strategies.get("SLOT_A")
                     slot_a_cands = getattr(slot_a, "selected_candidates", []) if slot_a else []
+
+                    slot_c = self.strategies.get("SLOT_C")
+                    if isinstance(slot_c, SlotCVolatilityBreakout):
+                        await slot_c.run_morning_calibration(exclude_tickers=slot_a_cands)
+
                     slot_d = self.strategies.get("SLOT_D")
                     if isinstance(slot_d, SlotDRetestSwing):
                         await slot_d.run_morning_screening(exclude_tickers=slot_a_cands)
@@ -605,7 +611,12 @@ class TradingOrchestrator:
 
                     accounts = await self.ledger.get_accounts()
                     positions = await self.ledger.get_positions()
-                    trades = await self.ledger.get_recent_trades(limit=20)
+                    all_trades = await self.ledger.get_recent_trades(limit=50)
+                    today_trades = [
+                        t for t in all_trades
+                        if (isinstance(t.exit_time, datetime) and t.exit_time.strftime("%Y-%m-%d") == today_str) or
+                           (isinstance(t.exit_time, str) and t.exit_time.startswith(today_str))
+                    ]
                     slot_d = self.strategies.get("SLOT_D")
                     screening = {
                         "SLOT_A": getattr(slot_a, "selected_candidates", getattr(slot_a, "universe", ["005930", "000660", "005380"])),
@@ -615,7 +626,7 @@ class TradingOrchestrator:
                     try:
                         self.latest_daily_review = await self.gemini_analyst.generate_daily_review(
                             accounts=[a.model_dump() for a in accounts],
-                            trades=[t.model_dump() for t in trades],
+                            trades=[t.model_dump() for t in today_trades],
                             positions=[p.model_dump() for p in positions],
                             screening_candidates=screening,
                             force_regenerate=True
