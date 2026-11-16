@@ -31,12 +31,13 @@ class JevCascadeClient:
         tick: TickData,
         target_price: float,
         avg_vol_20m: float,
-        vol_1m: float
+        vol_1m: float,
+        min_exec_strength: float = 110.0
     ) -> Tuple[bool, str]:
         """
         1단계 로컬 정량 필터 (0.1ms 실행, 95% 노이즈 사전 차단):
         - 목표가 돌파 여부
-        - 체결강도 >= 110.0%
+        - 체결강도 >= min_exec_strength (기본 110.0%, US 약세 시 120~125% 상향)
         - 1분 거래량 >= 20분 평균의 180% (고변동성/레버리지 ETF 실전 최적화)
         - 5분 쿨다운 미적용
         """
@@ -51,7 +52,7 @@ class JevCascadeClient:
             return False, "BELOW_TARGET_PRICE"
 
         # 3. 체결강도 검사
-        if tick.exec_strength < 110.0:
+        if tick.exec_strength < min_exec_strength:
             return False, f"EXEC_STRENGTH_LOW_{tick.exec_strength:.1f}%"
 
         # 4. 거래량 폭발 검사 (최근 장세 적응: 1분 거래량이 20분 평균의 180% 이상)
@@ -65,7 +66,8 @@ class JevCascadeClient:
         ticker: str,
         tick: TickData,
         target_price: float,
-        surge_ratio: float = 1.8
+        surge_ratio: float = 1.8,
+        us_context: str = ""
     ) -> Tuple[bool, float, str]:
         """
         2단계 OpenRouter typesafe/jev-1.13 API 호출 (Decisions 엔드포인트):
@@ -98,6 +100,8 @@ class JevCascadeClient:
 
         breakout_pct = ((tick.price - target_price) / target_price) * 100.0 if target_price > 0 else 0.0
 
+        us_line = f"\n- Overnight US Market: {us_context}" if us_context else ""
+
         # TypeSafe JEV 1.13 Decisions API 규격 페이로드 구성
         payload = {
             "model": "typesafe/jev-1.13",
@@ -107,7 +111,7 @@ class JevCascadeClient:
                 f"- Current Price: {tick.price:.1f} KRW (+{breakout_pct:.1f}% breakout above target {target_price:.1f} KRW)\n"
                 f"- Execution Strength: {tick.exec_strength:.1f}% (strong buying order flow)\n"
                 f"- Volume Surge: {surge_ratio:.1f}x of 20-minute average volume\n"
-                f"- Bid/Ask Ratio: {tick.bid_ask_ratio:.2f}"
+                f"- Bid/Ask Ratio: {tick.bid_ask_ratio:.2f}{us_line}"
             ),
             "questions": {
                 "is_fakeout": {

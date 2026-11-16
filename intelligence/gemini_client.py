@@ -64,19 +64,35 @@ class GeminiAnalyst:
                 self._save_report(file_path, history_path, res)
                 return res
 
-        # 3. 기본 Antigravity 시황 분석 포맷
+        # 3. 기본 Antigravity 시황 분석 포맷 (국내 코스피 20MA + 전일 미국장 매크로 레짐 통합)
         kospi = market_summary.get("kospi_index", 2600.0)
         ma20 = market_summary.get("kospi_20ma", 2580.0)
         change_pct = market_summary.get("kospi_daily_change_pct", 0.0)
         is_bull = kospi >= ma20
 
+        us_market = market_summary.get("us_market") or {}
+        us_regime = us_market.get("regime", "US_NEUTRAL")
+        us_line = us_market.get("summary_line", "")
+
+        us_guide_map = {
+            "US_PANIC": "전일 미국장 급락(US_PANIC) -> 슬롯 A·D 신규 스윙 1일 보류, 슬롯 B 09:20 이후 투매 관망 진입, 슬롯 C 인버스2X/체결강도 125% 이상만 선별 허용.",
+            "US_RISK_OFF": "전일 미국장 약세(US_RISK_OFF) -> 슬롯 A·D 09:00~09:30 장초반 30분 투매 진정 대기, 슬롯 C 롱 체결강도 120% 상향 및 JEV 필터 강화.",
+            "US_RISK_ON": "전일 미국장 강세(US_RISK_ON) -> 반도체·한국물 동반 랠리 기대, 슬롯 C 코스피 +0.3%부터 조기 돌파 허용 및 슬롯 A·D 정상 가동.",
+            "US_NEUTRAL": "전일 미국장 중립(US_NEUTRAL) -> 국내 코스피 20일선 및 개별 수급·돌파 기준에 따라 4대 슬롯 원칙 운용.",
+        }
+        domestic_guide = (
+            "코스피 20일선 상방 위치 (정상 추세 모드)"
+            if is_bull
+            else "코스피 20일선 하방 위치 (하락 방어막 가동 — 슬롯 B 중심 및 강반등 시 단타 선별)"
+        )
+
+        us_section = f"- **전일 미국 증시**: {us_line}\n" if us_line else ""
         briefing = (
             "### 🌅 [Antigravity AI] 08:50 장전 거시 시황 브리핑\n"
-            f"- **국내 증시 추세**: 코스피 지수({kospi:,.1f}p, {change_pct:+.2f}%)가 20일 이동평균선({ma20:,.1f}p) "
-            f"{'위에 위치하여 정상 상승 추세 유지 중' if is_bull else '아래에 위치하여 하락 방어막 가동 중'}.\n"
-            "- **슬롯별 전략 가이드**: "
-            + ("슬롯 A(수급 스윙) 및 슬롯 B(ETF 그리드) 적극 진입 유효." if is_bull else "슬롯 A/C/D 신규 진입 차단(현금 100% 보존), 슬롯 B(ETF 볼린저 그리드) 분할 매수만 허용.") + "\n"
-            "- **주요 관제 포인트**: 고변동성 장세 속 슬롯 B 분할 매수 및 TypeSafe JEV 1.13 가드레일 모니터링 가동."
+            f"- **국내 증시 추세**: 코스피 지수({kospi:,.1f}p, {change_pct:+.2f}%) / 20일선({ma20:,.1f}p) — {domestic_guide}.\n"
+            f"{us_section}"
+            f"- **슬롯별 전략 가이드**: {us_guide_map.get(us_regime, us_guide_map['US_NEUTRAL'])}\n"
+            "- **주요 관제 포인트**: TypeSafe JEV 1.13 가드레일(미국장 컨텍스트 연동) 및 슬롯별 칼손절(-1.8%~-3.0%) 규율 준수."
         )
         self._save_report(file_path, history_path, briefing)
         return briefing

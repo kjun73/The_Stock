@@ -319,6 +319,8 @@ class FirebaseBridge:
                             "is_panic_sell_day": self.orchestrator.market_filter.is_panic_sell_day,
                             "is_strong_rebound_day": self.orchestrator.market_filter.is_strong_rebound_day,
                             "is_super_rally_day": self.orchestrator.market_filter.is_super_rally_day,
+                            "us_regime": self.orchestrator.market_filter.us_regime,
+                            "us_summary": self.orchestrator.market_filter.us_summary,
                         },
                         "slots": {
                             acc.slot_id: {

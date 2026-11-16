@@ -1,7 +1,8 @@
 import logging
 import urllib.request
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,14 @@ class MarketFilterManager:
         self.kodex200_prev_close: float = 0.0
         self.kodex200_price: float = 0.0
         self.kodex200_ma20: float = 0.0
+        self.us_regime: str = "US_NEUTRAL"  # US_PANIC | US_RISK_OFF | US_NEUTRAL | US_RISK_ON
+        self.us_summary: str = ""
+
+    def update_us_market(self, regime: str, summary: str = ""):
+        """전일 미국장 매크로 레짐 및 요약 업데이트"""
+        self.us_regime = regime or "US_NEUTRAL"
+        self.us_summary = summary
+        logger.info(f"🌎 [마켓필터] US 매크로 레짐 반영: {self.us_regime} ({self.us_summary})")
 
     def refresh_from_history(self):
         """pykrx 및 네이버 금융을 활용해 실제 코스피 지수와 KODEX 200 20MA, 전일 종가를 동적 동기화"""
@@ -153,17 +162,24 @@ class MarketFilterManager:
         """당일 +1.2% 이상 대폭등 국면인지 여부 (우량주 스윙 진입 승인)"""
         return self.kospi_daily_change_pct >= 1.2
 
-    def can_enter(self, slot_id: str) -> bool:
-        """슬롯별 신규 진입 가능 여부 판정"""
-        # 1. 슬롯 B (ETF 역추세 볼린저 그리드): 당일 -3% 이상 패닉셀만 아니면 하락장에서도 분할 매수 허용
+    def can_enter(self, slot_id: str, current_time: Optional[dtime] = None) -> bool:
+        """슬롯별 신규 진입 가능 여부 판정 (코스피 20MA + 전일 미국장 레짐 연동)"""
+        now_t = current_time or datetime.now().time()
+
+        # 1. 슬롯 B (ETF 역추세 볼린저 그리드): 하락장이 오히려 매수 기회이나,
+        #    당일 -3% 패닉셀 또는 미국장 US_PANIC 시 장초반 20분(09:20 이전) 투매만 관망
         if slot_id == "SLOT_B":
             if self.is_panic_sell_day:
                 logger.warning(f"🛑 [마켓필터] 코스피 당일 {self.kospi_daily_change_pct:+.2f}% 급락 패닉셀 -> SLOT_B 매수 보류")
                 return False
+            if self.us_regime == "US_PANIC" and now_t < dtime(9, 20):
+                logger.info("⏳ [마켓필터] 전일 미국장 패닉(US_PANIC) -> SLOT_B 09:20까지 장초반 투매 관망")
+                return False
             return True
 
         # 2. 슬롯 C (변동성 돌파 단타): 당일 15:15 전량 청산하므로 오버나잇 위험 0%
-        #    당일 지수가 +0.8% 이상 강반등 중이면 20일선 아래라도 돌파 매수 적극 허용!
+        #    - 일반: 당일 지수 +0.8% 이상 강반등 시 20일선 아래라도 허용
+        #    - 미국장 강세(US_RISK_ON): 당일 +0.3% 이상부터 조기 허용
         if slot_id == "SLOT_C":
             if self.is_panic_sell_day:
                 logger.warning(f"🛑 [마켓필터] 당일 지수 {self.kospi_daily_change_pct:+.2f}% 패닉셀 -> SLOT_C 진입 차단")
@@ -172,6 +188,12 @@ class MarketFilterManager:
                 logger.info(
                     f"🚀 [마켓필터] 당일 코스피 강반등({self.kospi_daily_change_pct:+.2f}%) 감지 -> "
                     f"SLOT_C(돌파 단타) 진입 전격 승인"
+                )
+                return True
+            if self.us_regime == "US_RISK_ON" and self.kospi_daily_change_pct >= 0.3:
+                logger.info(
+                    f"🚀 [마켓필터] 미국장 강세(US_RISK_ON) + 코스피 견조({self.kospi_daily_change_pct:+.2f}%) -> "
+                    f"SLOT_C 조기 진입 승인"
                 )
                 return True
             if self.is_under_20ma:
@@ -183,10 +205,18 @@ class MarketFilterManager:
             return True
 
         # 3. 슬롯 A, D (수급/눌림목 스윙):
-        #    스윙 전략은 오버나잇을 고려하여 20일선 아래일 때는 당일 +1.2% 이상 대폭등 시에만 진입 허용!
+        #    - US_PANIC: 미국 반도체/한국물 폭락 다음 날 신규 스윙 매수 1일 보류 (11/02 손실 사례 방어)
+        #    - US_RISK_OFF: 09:00~09:30 장초반 30분 외인 투매 진정 대기 후 진입
+        #    - 코스피 20일선 아래일 때는 당일 +1.2% 이상 대폭등 시에만 진입 허용
         if slot_id in ("SLOT_A", "SLOT_D"):
             if self.is_panic_sell_day:
                 logger.warning(f"🛑 [마켓필터] 당일 지수 {self.kospi_daily_change_pct:+.2f}% 패닉셀 -> {slot_id} 매수 차단")
+                return False
+            if self.us_regime == "US_PANIC":
+                logger.warning(f"🛑 [마켓필터] 전일 미국장 패닉(US_PANIC) 감지 -> {slot_id} 금일 신규 스윙 매수 1일 보류")
+                return False
+            if self.us_regime == "US_RISK_OFF" and dtime(9, 0) <= now_t < dtime(9, 30):
+                logger.info(f"⏳ [마켓필터] 전일 미국장 약세(US_RISK_OFF) -> {slot_id} 09:30까지 시초가 투매 관망 지연")
                 return False
             if self.is_under_20ma and not self.is_super_rally_day:
                 logger.warning(

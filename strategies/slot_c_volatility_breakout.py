@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 ETF_UNIVERSE_SET = {"069500", "229200", "122630", "233740", "114800", "252670"}
+INVERSE_ETF_SET = {"114800", "252670"}
 
 DEFAULT_MOMENTUM_UNIVERSE = [
     "233740",  # KODEX 코스닥150레버리지 (거래세 0% 면제, 최고 탄력 ETF)
@@ -60,6 +61,13 @@ class SlotCVolatilityBreakout(BaseStrategy):
         self.trailing_activation_rate: float = 2.0      # +2.0% 도달 시 트레일링 활성화
         self.trailing_drop_rate: float = 0.8            # 최고가 대비 -0.8% 반락 시 익절 (최소 +1.2% 명목수익 확보)
         self.stop_loss_rate: float = -1.8               # 돌파 실패 시 -1.8% 칼손절 (손익비 비대칭성 확보)
+        self.us_regime: str = "US_NEUTRAL"              # 전일 미국장 매크로 레짐
+        self.us_context: str = ""                       # JEV 판정 주입용 미국장 요약
+
+    def set_us_context(self, regime: str, summary: str = ""):
+        """08:45 미국장 레짐 및 요약 컨텍스트 주입"""
+        self.us_regime = regime or "US_NEUTRAL"
+        self.us_context = summary
 
     def update_watchlist(self, top_tickers: List[str], target_prices_map: Dict[str, float], prev_ranges_map: Optional[Dict[str, float]] = None):
         self.universe = top_tickers[:25]
@@ -241,23 +249,34 @@ class SlotCVolatilityBreakout(BaseStrategy):
             float(tick.volume) if tick.volume > 0 else (avg_vol * 1.8)
         )
 
+        # US 매크로 레짐별 체결강도 문턱 동적 조정 (인버스 ETF 제외, 약세 시 롱 가짜 반등 엄격 차단)
+        is_inverse = tick.ticker in INVERSE_ETF_SET
+        min_strength = 110.0
+        if not is_inverse:
+            if self.us_regime == "US_PANIC":
+                min_strength = 125.0
+            elif self.us_regime == "US_RISK_OFF":
+                min_strength = 120.0
+
         # 1단계: 로컬 정량 필터 (0.1ms, $0)
         passed_stage1, reason1 = self.jev_client.check_stage1_filter(
             tick=tick,
             target_price=target_price,
             avg_vol_20m=avg_vol,
-            vol_1m=vol_1m
+            vol_1m=vol_1m,
+            min_exec_strength=min_strength
         )
         if not passed_stage1:
             return None
 
-        # 2단계: JEV 1.13 초고속 API 호출 (700ms 타임아웃)
+        # 2단계: JEV 1.13 초고속 API 호출 (700ms 타임아웃, 미국장 컨텍스트 포함)
         surge_ratio = vol_1m / max(avg_vol, 1.0)
         is_approved, fakeout_prob, reason2 = await self.jev_client.evaluate_stage2_jev(
             ticker=tick.ticker,
             tick=tick,
             target_price=target_price,
-            surge_ratio=surge_ratio
+            surge_ratio=surge_ratio,
+            us_context=self.us_context
         )
 
         if is_approved:

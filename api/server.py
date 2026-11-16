@@ -136,7 +136,9 @@ async def get_system_status():
             "is_bear_market": orchestrator.market_filter.is_bear_market,
             "is_panic_sell_day": orchestrator.market_filter.is_panic_sell_day,
             "is_strong_rebound_day": orchestrator.market_filter.is_strong_rebound_day,
-            "is_super_rally_day": orchestrator.market_filter.is_super_rally_day
+            "is_super_rally_day": orchestrator.market_filter.is_super_rally_day,
+            "us_regime": orchestrator.market_filter.us_regime,
+            "us_summary": orchestrator.market_filter.us_summary
         },
         "slots_summary": [
             {

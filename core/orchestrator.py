@@ -12,6 +12,7 @@ from core.ledger import SqliteLedger
 from core.models import ExitReason, Signal, SlotAccount, SlotPosition, TickData, TradeRecord
 from intelligence.gemini_client import GeminiAnalyst
 from intelligence.jev_client import JevCascadeClient
+from intelligence.us_market import USMarketMonitor
 from resilience.watchdog import WatchdogManager
 from strategies.base import BaseStrategy
 from strategies.market_filter import MarketFilterManager
@@ -33,6 +34,7 @@ class TradingOrchestrator:
         self.market_filter = MarketFilterManager()
         self.gemini_analyst = GeminiAnalyst()
         self.jev_client = JevCascadeClient()
+        self.us_monitor = USMarketMonitor()
         self.watchdog = WatchdogManager(
             ledger=self.ledger,
             get_tick_func=self.get_tick_for_watchdog
@@ -101,6 +103,51 @@ class TradingOrchestrator:
             return self._price_cache[ticker]
         return await self.kis_client.get_realtime_price(ticker)
 
+    async def _sync_us_market_context(self) -> dict:
+        """전일 미국장 마감 지표를 수집하여 마켓필터 및 슬롯 C JEV 컨텍스트에 반영"""
+        snapshot = await self.us_monitor.fetch_snapshot()
+        self.market_filter.update_us_market(snapshot.regime, snapshot.summary_line)
+        slot_c = self.strategies.get("SLOT_C")
+        if isinstance(slot_c, SlotCVolatilityBreakout):
+            slot_c.set_us_context(snapshot.regime, snapshot.summary_line)
+        return snapshot.model_dump()
+
+    async def _execute_morning_routine(self, today_str: str):
+        """08:45 장전 루틴 공통 실행 (holding_days 갱신, 미국장 동기화, 전략 리셋, 스크리닝, 브리핑)"""
+        await self.ledger.refresh_holding_days()
+        us_market_dict = await self._sync_us_market_context()
+
+        for strat in self.strategies.values():
+            if hasattr(strat, "reset_daily_state"):
+                strat.reset_daily_state()
+
+        slot_a = self.strategies.get("SLOT_A")
+        slot_a_cands = getattr(slot_a, "selected_candidates", []) if slot_a else []
+
+        slot_c = self.strategies.get("SLOT_C")
+        if isinstance(slot_c, SlotCVolatilityBreakout):
+            await slot_c.run_morning_calibration(exclude_tickers=slot_a_cands)
+
+        slot_d = self.strategies.get("SLOT_D")
+        if isinstance(slot_d, SlotDRetestSwing):
+            await slot_d.run_morning_screening(exclude_tickers=slot_a_cands)
+            self.sync_all_subscriptions()
+
+        await self.sync_half_kelly_capitals()
+
+        try:
+            self.latest_morning_briefing = await self.gemini_analyst.generate_morning_briefing({
+                "kospi_index": self.market_filter.kospi_index,
+                "kospi_20ma": self.market_filter.kospi_20ma,
+                "kospi_daily_change_pct": self.market_filter.kospi_daily_change_pct,
+                "watchlist_count": len(self.strategies["SLOT_C"].universe),
+                "us_market": us_market_dict,
+            }, force_regenerate=True)
+        except Exception as e:
+            logger.warning(f"장전 브리핑 생성 예외: {e}")
+
+        self._last_morning_screen_date = today_str
+
     async def _check_and_run_morning_catchup(self):
         """08:45 이후(정규장 중 포함) 기동되었을 때 장전 스크리닝이 누락되지 않도록 즉시 실행"""
         now = datetime.now()
@@ -109,37 +156,11 @@ class TradingOrchestrator:
 
         if current_time >= dtime(8, 45) and current_time < dtime(15, 30):
             if self._last_morning_screen_date != today_str:
-                logger.info("☀️ [Orchestrator] 08:45 이후(정규장 중) 기동 감지 -> 장전 리셋, 캘리브레이션 및 슬롯 D 스크리닝 즉시 실행")
-                await self.ledger.refresh_holding_days()
-                for strat in self.strategies.values():
-                    if hasattr(strat, "reset_daily_state"):
-                        strat.reset_daily_state()
-
-                slot_a = self.strategies.get("SLOT_A")
-                slot_a_cands = getattr(slot_a, "selected_candidates", []) if slot_a else []
-
-                slot_c = self.strategies.get("SLOT_C")
-                if isinstance(slot_c, SlotCVolatilityBreakout):
-                    await slot_c.run_morning_calibration(exclude_tickers=slot_a_cands)
-
-                slot_d = self.strategies.get("SLOT_D")
-                if isinstance(slot_d, SlotDRetestSwing):
-                    await slot_d.run_morning_screening(exclude_tickers=slot_a_cands)
-                    self.sync_all_subscriptions()
-
-                await self.sync_half_kelly_capitals()
-
-                try:
-                    self.latest_morning_briefing = await self.gemini_analyst.generate_morning_briefing({
-                        "kospi_index": self.market_filter.kospi_index,
-                        "kospi_20ma": self.market_filter.kospi_20ma,
-                        "kospi_daily_change_pct": self.market_filter.kospi_daily_change_pct,
-                        "watchlist_count": len(self.strategies["SLOT_C"].universe)
-                    }, force_regenerate=True)
-                except Exception as e:
-                    logger.warning(f"장전 브리핑 캐치업 예외: {e}")
-
-                self._last_morning_screen_date = today_str
+                logger.info("☀️ [Orchestrator] 08:45 이후(정규장 중) 기동 감지 -> 장전 리셋, 미국장 연동, 캘리브레이션 및 슬롯 D 스크리닝 즉시 실행")
+                await self._execute_morning_routine(today_str)
+        elif self.us_monitor.latest_snapshot is None:
+            # 08:35 조기 기동 또는 장마감 후에도 미국장 현황 프리로드
+            await self._sync_us_market_context()
 
     async def _check_and_run_evening_catchup(self):
         """15:40 이후 또는 장마감 후 기동되었을 때 슬롯 A 스크리닝 및 당일 복기가 누락되지 않도록 즉시 실행"""
@@ -547,39 +568,10 @@ class TradingOrchestrator:
                 today_str = now.strftime("%Y-%m-%d")
                 current_time = now.time()
 
-                # 1. 08:45 이후 장전 리셋, 캘리브레이션, 슬롯 D 스크리닝 및 Gemini 브리핑
+                # 1. 08:45 이후 장전 리셋, 미국장 연동, 캘리브레이션, 슬롯 D 스크리닝 및 Gemini 브리핑
                 if current_time >= dtime(8, 45) and current_time < dtime(15, 30) and self._last_morning_screen_date != today_str:
-                    logger.info("⏰ [08:45] 장전 루틴 가동: holding_days 갱신, 전략 리셋, 캘리브레이션 및 슬롯 D 스크리닝")
-                    await self.ledger.refresh_holding_days()
-                    for strat in self.strategies.values():
-                        if hasattr(strat, "reset_daily_state"):
-                            strat.reset_daily_state()
-
-                    slot_a = self.strategies.get("SLOT_A")
-                    slot_a_cands = getattr(slot_a, "selected_candidates", []) if slot_a else []
-
-                    slot_c = self.strategies.get("SLOT_C")
-                    if isinstance(slot_c, SlotCVolatilityBreakout):
-                        await slot_c.run_morning_calibration(exclude_tickers=slot_a_cands)
-
-                    slot_d = self.strategies.get("SLOT_D")
-                    if isinstance(slot_d, SlotDRetestSwing):
-                        await slot_d.run_morning_screening(exclude_tickers=slot_a_cands)
-                        self.sync_all_subscriptions()
-
-                    await self.sync_half_kelly_capitals()
-
-                    try:
-                        self.latest_morning_briefing = await self.gemini_analyst.generate_morning_briefing({
-                            "kospi_index": self.market_filter.kospi_index,
-                            "kospi_20ma": self.market_filter.kospi_20ma,
-                            "kospi_daily_change_pct": self.market_filter.kospi_daily_change_pct,
-                            "watchlist_count": len(self.strategies["SLOT_C"].universe)
-                        }, force_regenerate=True)
-                    except Exception as e:
-                        logger.warning(f"장전 브리핑 예외: {e}")
-
-                    self._last_morning_screen_date = today_str
+                    logger.info("⏰ [08:45] 장전 루틴 가동: holding_days 갱신, 미국장 연동, 전략 리셋, 캘리브레이션 및 슬롯 D 스크리닝")
+                    await self._execute_morning_routine(today_str)
 
                 # 2. 15:15 슬롯 C 단타 당일 전량 청산
                 if current_time >= dtime(15, 15) and current_time < dtime(15, 30) and getattr(self, '_last_exit_1515_date', None) != today_str:
